@@ -359,13 +359,22 @@ logical request may continue for `OLLAMA_UNIFY_REQUEST_DETACHED_TTL` seconds
 (default 30), renewed by backend progress, so a quick completion remains
 replayable without allowing abandoned generation to live forever. Transport
 cancellation gets `OLLAMA_UNIFY_REQUEST_CANCEL_GRACE` seconds (default 5); a
-managed lane that still does not terminate is stopped before its reservation
-is released. Each process-group stop attempt also has a bounded, automatically
-renewed deadline; an unproven stop keeps its reservation charged. Release is
+managed lane that still does not terminate receives a process-group SIGTERM
+before its reservation can be released. Automatic CUDA cancellation never
+escalates to SIGKILL: an unresponsive parent or surviving runner retains the
+whole lane's reservation and blocks replacement until the process group exits.
+Other backends retain bounded SIGKILL escalation. Cancellation retains the
+exact backend socket even when a `Connection: close` response transfers socket
+ownership away from HTTPConnection. Each process-group stop attempt has a
+bounded, automatically renewed deadline; an unproven stop keeps its reservation
+charged. Release is
 keyed by the original admission, so delayed handler
 cleanup cannot decrement a newer request. Status and discovery expose only
 aggregate phases, ages, renewals, disconnects, expiries, cancellations, and
 forced lane stops—never prompts, fingerprints, or logical IDs.
+Stop diagnostics identify a busy transition, a specific safety guard, or a
+surviving process group, and discovery exposes `cancel_process_policy`.
+This teardown policy does not certify GPU, PCIe or NVLink hardware stability.
 
 Operators can give an exact tagged model a soft ordered GPU preference through
 `OLLAMA_UNIFY_MODEL_GPU_PREFERENCES`, for example

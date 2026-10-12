@@ -2134,6 +2134,9 @@ def discovery_document() -> dict[str, Any]:
                 "detached_ttl_seconds": REQUEST_DETACHED_TTL,
                 "cancel_grace_seconds": REQUEST_CANCEL_GRACE,
                 "lane_stop_attempt_ttl_seconds": LANE_STOP_ATTEMPT_TTL,
+                "cancel_process_policy": (
+                    "sigterm_only" if BACKEND_TYPE == "cuda" else "sigterm_then_sigkill"
+                ),
                 "renewal_events": ["backend_connected", "response_headers", "response_chunk"],
                 "non_logical_disconnect": "cancel_immediately",
                 "logical_disconnect": "renewable_completion_window",
@@ -3162,6 +3165,9 @@ class ActiveRequest:
     backend_completed: bool = False
     lane_stop_started: bool = False
     lane_stopped: bool = False
+    # HTTPConnection drops .sock when a close-delimited response takes
+    # ownership. Keep the exact transport so cancellation still reaches it.
+    backend_socket: Any = field(default=None, repr=False)
     # Serialize the last client write against EOF/reset observation. Without
     # this per-request guard, a client that closes immediately after reading a
     # complete fixed-length body can race the handler's completion commit and
@@ -4916,7 +4922,7 @@ class Broker:
         )
 
     @staticmethod
-    def _terminate_process(process: Any) -> bool:
+    def _terminate_process(process: Any, *, allow_force: bool = True) -> bool:
         if process is None:
             return True
         process_group = process.pid
@@ -4928,6 +4934,8 @@ class Broker:
         try:
             process.wait(timeout=15)
         except subprocess.TimeoutExpired:
+            if not allow_force:
+                return False
             try:
                 os.killpg(process_group, signal.SIGKILL)
             except OSError:
@@ -4940,6 +4948,8 @@ class Broker:
         # process group. Reservation release requires the complete group to be
         # gone, not merely a reaped parent Popen.
         if process_group_alive(process):
+            if not allow_force:
+                return False
             try:
                 os.killpg(process_group, signal.SIGKILL)
             except OSError:
@@ -5913,6 +5923,15 @@ class Broker:
             self.cv.notify_all()
             return True
 
+    def request_backend_connected(self, admission: Admission, sock: Any) -> bool:
+        """Bind the exact socket before dispatch, including cancellation races."""
+        with self.cv:
+            active = self._owned_active_request_locked(admission)
+            if active is None or active.cancel_requested_at is not None:
+                return False
+            active.backend_socket = sock
+            return True
+
     def _mark_active_cancelling_locked(
         self,
         active: ActiveRequest,
@@ -6035,7 +6054,9 @@ class Broker:
         backend = active.backend
         if backend is None:
             return
-        sock = getattr(backend, "sock", None)
+        sock = active.backend_socket
+        if sock is None:
+            sock = getattr(backend, "sock", None)
         if sock is not None:
             try:
                 sock.shutdown(socket.SHUT_RDWR)
@@ -6078,6 +6099,9 @@ class Broker:
             "detached_ttl_seconds": REQUEST_DETACHED_TTL,
             "cancel_grace_seconds": REQUEST_CANCEL_GRACE,
             "lane_stop_attempt_ttl_seconds": LANE_STOP_ATTEMPT_TTL,
+            "cancel_process_policy": (
+                "sigterm_only" if BACKEND_TYPE == "cuda" else "sigterm_then_sigkill"
+            ),
             "activity_renewed_total": self.request_activity_renewed_total,
             "disconnected_total": self.request_disconnected_total,
             "expired_total": self.request_expired_total,
@@ -6158,6 +6182,8 @@ class Broker:
 
     def _stop_expired_lane(self, lane: Lane) -> None:
         group_stopped = False
+        allow_force = BACKEND_TYPE != "cuda"
+        stop_reason = "transition_busy"
         # A drain may own transition while waiting for this exact active
         # request. Never wait for that lock: retain ownership and retry after
         # the bounded drain finishes or aborts instead of deadlocking it.
@@ -6165,17 +6191,20 @@ class Broker:
         if acquired:
             try:
                 self._require_safe_gpu_transition(lane.protected_scope, lane.lane_id)
-                group_stopped = self._terminate_process(lane.process)
-            except CapacityError:
-                pass
+                group_stopped = self._terminate_process(lane.process, allow_force=allow_force)
+                stop_reason = "process_group_alive"
+            except CapacityError as exc:
+                stop_reason = exc.reason_code
             finally:
                 self.transition.release()
         if not group_stopped:
             LOG.error(
                 "managed Ollama lane did not stop after request cancellation "
-                "id=%s gpu=%s; retaining its admission accounting",
+                "id=%s gpu=%s reason=%s hard_kill_allowed=%s; retaining its admission accounting",
                 lane.lane_id,
                 lane.gpu_uuid,
+                stop_reason,
+                allow_force,
             )
             with self.cv:
                 now = time.monotonic()
@@ -6187,10 +6216,11 @@ class Broker:
                 self.cv.notify_all()
             return
         LOG.warning(
-            "managed Ollama lane force-stopped after request cancellation "
-            "id=%s gpu=%s",
+            "managed Ollama lane stopped after request cancellation "
+            "id=%s gpu=%s hard_kill_allowed=%s",
             lane.lane_id,
             lane.gpu_uuid,
+            allow_force,
         )
         with self.cv:
             self.lanes.pop(lane.lane_id, None)
@@ -8626,6 +8656,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         response_started = False
         succeeded = False
         backend = None
+        response = None
         watcher_stop_reader = None
         watcher_stop_writer = None
         client_watcher = None
@@ -8662,6 +8693,11 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             if not self.broker.request_backend_started(admission, backend):
                 raise ConnectionAbortedError(
                     "request was cancelled before backend connection"
+                )
+            backend.connect()
+            if not self.broker.request_backend_connected(admission, backend.sock):
+                raise ConnectionAbortedError(
+                    "request was cancelled before backend dispatch"
                 )
             backend.request(self.command, self.path, body=body if body else None, headers=headers)
             if not self.broker.renew_request_activity(
@@ -8891,6 +8927,8 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 self.connection.settimeout(client_socket_timeout)
             except OSError:
                 pass
+            if response is not None:
+                response.close()
             if backend is not None:
                 backend.close()
             if admission is not None:
