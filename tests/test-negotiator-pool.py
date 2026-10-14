@@ -982,20 +982,53 @@ def test_capacity_gpu_constraint_is_hard_and_validated(helper, fixture_bin):
         assert empty["reason_code"] == "gpu_constraint_empty"
 
 
-def test_lease_registration_requires_visible_coordination_metadata(
+def test_lease_registration_metadata_is_advisory_and_visible(
     helper, fixture_bin,
 ):
     with PoolHarness(helper, fixture_bin, max_servers=1) as harness:
-        rejected = control_raw(harness.socket_path, {
+        basic = control(harness.socket_path, {
             "action": "acquire",
             "owner": "tau-fixture",
             "requested_mib": 1024,
             "ttl": 30,
             "gpu_uuids": ["GPU-large-0"],
         })
-        assert rejected["ok"] is False
-        assert "justification" in rejected["error"]
-        assert harness.status()["leases"] == []
+        public = basic["public_lease"]
+        assert public["justification"] == "not provided"
+        assert public["expected_release_at"] is None
+        assert public["expected_release_utc"] is None
+        assert public["horizon_status"] == "unknown"
+        assert len(public["recommendations"]) == 2
+        assert basic["lease"]["ttl"] == 30
+        assert basic["lease"]["expected_release_at"] == 0.0
+        assert basic["lease"]["gpu_uuids"] == ["GPU-large-0"]
+        status = harness.status()
+        assert status["lease_summaries"][0]["recommendations"] == public["recommendations"]
+        discovery = http_json(harness.proxy_port, "GET",
+            "/.well-known/ollama-unify-gpu-negotiator")[1]
+        assert discovery["active_leases"][0]["recommendations"] == public["recommendations"]
+        assert basic["lease"]["token"] not in json.dumps(discovery)
+        assert discovery["lease_policy"]["required_acquire_fields"] == ["owner"]
+        assert discovery["lease_policy"]["recommended_acquire_fields"] == [
+            "justification", "expected_duration_seconds",
+        ]
+        control(harness.socket_path, {
+            "action": "ready", "token": basic["lease"]["token"],
+        })
+        control(harness.socket_path, {
+            "action": "release", "token": basic["lease"]["token"],
+        })
+        cli = subprocess.run([
+            helper, "acquire", "--owner", "portal-cli", "--gpu", "GPU-large-0",
+            "--vram-mib", "1024", "--ttl", "30", "--token-only",
+        ], env={**os.environ, "OLLAMA_UNIFY_SOCKET": harness.socket_path,
+                "OLLAMA_UNIFY_CONFIG": os.path.join(harness.temp_dir, "missing.conf")},
+            check=True, capture_output=True, text=True, timeout=10)
+        token = cli.stdout.strip()
+        assert token.startswith("lease_") and "\n" not in token
+        assert "non-blocking" in cli.stderr
+        assert "--justification" in cli.stderr and "--expected-duration" in cli.stderr
+        control(harness.socket_path, {"action": "release", "token": token})
 
         acquired = control(harness.socket_path, {
             "action": "acquire",
@@ -1011,6 +1044,7 @@ def test_lease_registration_requires_visible_coordination_metadata(
             "run the Tau simulation workload"
         )
         assert "token" not in acquired["public_lease"]
+        assert acquired["public_lease"]["recommendations"] == []
         status = harness.status()
         assert status["lease_summaries"][0]["expected_release_utc"]
         assert "tau-fixture until" in status["warnings"][0]
@@ -3363,7 +3397,7 @@ def main():
     test_default_context_is_pinned_on_warmup_and_inference(helper, fixture_bin)
     test_fixed_model_context_is_attested_and_enforced(helper, fixture_bin)
     test_capacity_gpu_constraint_is_hard_and_validated(helper, fixture_bin)
-    test_lease_registration_requires_visible_coordination_metadata(
+    test_lease_registration_metadata_is_advisory_and_visible(
         helper, fixture_bin,
     )
     test_lazy_inference_gpu_constraint_ignores_wrong_gpu_lane(helper, fixture_bin)

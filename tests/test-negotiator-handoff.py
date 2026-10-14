@@ -44,7 +44,7 @@ class HandoffTests(unittest.TestCase):
         with p.PoolHarness(HELPER, FIXTURE_BIN) as case:
             token = incumbent(case)
             with concurrent.futures.ThreadPoolExecutor() as executor:
-                waiting = executor.submit(acquire, case)
+                waiting = executor.submit(acquire, case, justification='', expected_duration_seconds=0)
                 p.wait_until(lambda: case.status()['lease_handoff_requests'], 'intent is published')
                 status = case.status()
                 self.assertEqual(status['leases'][0]['state'], 'active')
@@ -104,8 +104,8 @@ class HandoffTests(unittest.TestCase):
         with p.PoolHarness(HELPER, FIXTURE_BIN) as case:
             incumbent(case)
             for changes in [
-                {'owner': 'voice-service'}, {'owner': ''}, {'justification': ''},
-                {'expected_duration_seconds': 0}, {'requested_mib': 10**12},
+                {'owner': 'voice-service'}, {'owner': ''}, {'justification': 'x' * 513},
+                {'expected_duration_seconds': -1}, {'requested_mib': 10**12},
                 {'gpu_uuids': [GPUS[0], GPUS[1]], 'yield_on_request': True},
                 {'gpu_uuids': [GPUS[0], 'GPU-unselected']}, {'yield_on_request': 'true'},
             ]:

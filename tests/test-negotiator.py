@@ -169,7 +169,7 @@ def main():
         assert discovery["commands"]["discover"] == "docker gpu discover"
         assert "scope" in discovery["commands"]["manual"]
         assert discovery["lease_policy"]["required_acquire_fields"] == [
-            "owner", "justification", "expected_duration_seconds",
+            "owner",
         ]
         assert any("Live lease state is unavailable" in warning
                    for warning in discovery["warnings"])
@@ -211,7 +211,7 @@ def main():
             assert empty_discovery["active_leases"] == []
             assert empty_discovery["warnings"] == [], empty_discovery["warnings"]
             assert empty_discovery["lease_policy"]["required_acquire_fields"] == [
-                "owner", "justification", "expected_duration_seconds",
+                "owner",
             ]
             empty_status = control(socket_path, {"action": "status"})
             assert empty_status["lease_summaries"] == []
@@ -452,10 +452,6 @@ def main():
                     "run",
                     "--owner",
                     "restart-safe-child",
-                    "--justification",
-                    "exercise restart-safe lease wrapper",
-                    "--expected-duration",
-                    "30",
                     "--vram-mib",
                     "1",
                     "--ttl",

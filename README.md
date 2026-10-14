@@ -188,14 +188,25 @@ For workloads managed by another supervisor, use the explicit lifecycle:
 4. Before increasing the workload's VRAM use, call `prepare <token>`, resize it, then call `ready <token>` again.
 5. Stop the external workload, ensuring its CUDA allocation is gone, then call `release <token>` so Ollama can reload and expand.
 
-Lease registration is intentionally visible and requires a specific owner, a
-meaningful justification, and an expected duration. `docker gpu discover`, the
-HTTP discovery endpoint, and `docker gpu status` publish token-free summaries
-with the owner, purpose, GPU UUIDs, and expected release time. They also emit a
-prominent coordination warning. Agents must inspect those summaries before
-requesting a GPU; conflicting acquisition errors identify the current lessee
-and horizon. Existing pre-policy leases remain visible as legacy entries with
-unknown justification or release time until they end.
+Lease registration requires a specific owner. A meaningful purpose
+(`--justification`) and expected duration (`--expected-duration`, in seconds)
+are recommended when setting up workloads, but both are optional. Basic
+acquisition works with `docker gpu acquire --owner <name> --gpu <uuid>`;
+`docker gpu run` also accepts omitted metadata while still requiring readiness.
+
+Discovery advertises required and recommended fields separately. Acquisition
+returns non-blocking recommendations in `public_lease.recommendations`, and
+the CLI prints them on stderr without changing its exit status or token-only
+stdout. Unknown purpose and release time stay unknown, including for existing
+leases. Expected duration is coordination metadata, separate from heartbeat TTL
+and pending deadlines; omission does not disable expiry or cleanup.
+
+`docker gpu discover`, HTTP discovery, and `docker gpu status` publish token-free
+summaries of owner, purpose, GPU UUIDs, and expected release time, with a
+coordination warning when leases exist. Agents must inspect those summaries
+before acquiring. Scope conflicts, VRAM capacity, and GPU health checks still
+block unsafe admission. Conflicting acquisition errors identify the current
+lessee and horizon.
 
 Lease heartbeat clients tolerate a bounded negotiator service restart. They
 retry the same persisted token and never acquire a replacement scope or change

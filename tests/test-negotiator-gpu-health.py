@@ -291,7 +291,7 @@ class GpuHealthTests(unittest.TestCase):
     def test_empty_leases_are_quiet_but_every_reserved_state_remains_visible(self):
         self.assertEqual(n.lease_visibility_warnings([]), [])
         self.assertEqual(n.lease_policy_document()['required_acquire_fields'], [
-            'owner', 'justification', 'expected_duration_seconds',
+            'owner',
         ])
         for state in ('pending', 'active', 'revoking'):
             with self.subTest(state=state):
