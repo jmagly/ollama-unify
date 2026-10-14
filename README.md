@@ -465,7 +465,36 @@ The broker records which application sends each request and which Ollama lane se
 
 Only process names are recorded, never command lines, which can contain secrets. Client attribution is an expiring observability cache: `OLLAMA_UNIFY_CLIENT_HISTORY_TTL` defaults to 3600 seconds and is renewed automatically whenever that client sends a request. When activity stops, the top-level client record, its per-lane history, and each lane's *Used by* entry expire naturally. An in-flight request remains attributed even when it runs beyond the TTL, then becomes eligible for expiry after it exits. Broker status publishes `expires_at` on retained attribution rows and `client_history_policy` with the effective TTL and bounds. The cache keeps at most 256 clients (`OLLAMA_UNIFY_CLIENT_HISTORY_LIMIT`), 32 lanes per client (`OLLAMA_UNIFY_CLIENT_LANE_HISTORY_LIMIT`), and eight clients per lane. Broker status (`clients`) includes request counts per model and retained lane; each lane reports `triggered_by`, the client whose request started it, and its recent clients. The tray shows *Started for* and *Used by* in each lane's submenu, and a *Clients* section lists the 20 most recent applications with their identity and lanes.
 
+### Manual inference hold
+
+Set `OLLAMA_UNIFY_INFERENCE_HOLD_FILE` in the negotiator's service environment
+to an operator-controlled file path. While that file exists, new native and
+OpenAI inference requests, capacity preparation, managed-lane creation and
+model selection fail with HTTP 503 and `reason_code=operator_inference_hold`.
+Metadata and GPU lease-control APIs remain available. Existing executing
+requests are not forcibly terminated, and all selected GPUs remain selected.
+
+Creating or removing the file takes effect dynamically. Its text supplies the
+operator reason; an unreadable file fails closed. The daemon publishes the
+effective hold through discovery/status, and `docker gpu discover` uses that
+daemon value even when the CLI has a different environment. Removing a hold
+admits waiting/background clients immediately, so release it deliberately.
+
 ### Surviving Ollama upgrades
+
+Hosts with an executable `/usr/local/sbin/ollama-version-guard` delegate release
+admission to that host-owned manager. On those hosts, `--update-ollama` refuses
+before downloading or stopping either service, including in noninteractive
+and assume-yes modes. The generated reconciliation helper executes the
+manager's `ensure` operation and propagates failure; it never accepts a changed
+binary as a new approved version or falls through to the legacy restart path.
+Manual `--reconcile` also refuses its legacy service cycle and directs the
+operator to `sudo ollama-version-guard ensure`.
+Install and authorize updates through that manager's documented workflow.
+The manager itself is supplied by the host; this integration does not install
+it, grant upgrade permission or certify a new release's CUDA behavior.
+
+The following legacy upgrade behavior applies to hosts without that manager.
 
 The official Ollama installer rewrites `/etc/systemd/system/ollama.service` and restarts the daemon. The unit it writes carries no `OLLAMA_HOST`, so the pinned loopback backend exists only in the late-priority ollama-unify drop-in. If that drop-in is cleared or drifts, Ollama falls back to its built-in `0.0.0.0:11434` and collides head-on with the negotiator that already owns that address — whichever process loses the bind race dies.
 

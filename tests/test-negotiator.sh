@@ -5,6 +5,8 @@ repo_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 test_tmp=$(mktemp -d)
 trap 'rm -rf "$test_tmp"' EXIT
 
+python3 "$repo_dir/tests/test-version-guard-integration.py" "$repo_dir"
+
 listen=$(
   # shellcheck disable=SC1091
   source "$repo_dir/ollama-unify.sh"
@@ -68,6 +70,7 @@ python3 "$repo_dir/tests/test-tray.py" "$test_tmp/ollama-unify-tray"
 python3 "$repo_dir/tests/test-client-identity.py" "$test_tmp/ollama-unify-gpu-negotiator"
 python3 "$repo_dir/tests/test-negotiator-cancellation.py" "$test_tmp/ollama-unify-gpu-negotiator"
 python3 "$repo_dir/tests/test-negotiator-gpu-health.py" "$test_tmp/ollama-unify-gpu-negotiator"
+python3 "$repo_dir/tests/test-negotiator-inference-hold.py" "$test_tmp/ollama-unify-gpu-negotiator"
 python3 "$repo_dir/tests/test-negotiator-model-context.py" \
   "$test_tmp/ollama-unify-gpu-negotiator" "$repo_dir/tests/fixtures/bin"
 python3 "$repo_dir/tests/test-negotiator-model-footprint.py" \

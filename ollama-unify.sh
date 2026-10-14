@@ -1265,6 +1265,7 @@ load_environment_file(os.environ.get(
 BACKEND_HOST, BACKEND_PORT = split_address(os.environ.get("OLLAMA_UNIFY_BACKEND", "127.0.0.1:11436"))
 LISTEN_HOST, LISTEN_PORT = split_address(os.environ.get("OLLAMA_UNIFY_LISTEN", "127.0.0.1:11434"))
 CONTROL_SOCKET = os.environ.get("OLLAMA_UNIFY_SOCKET", "/run/ollama-unify/gpu-negotiator.sock")
+INFERENCE_HOLD_FILE = os.environ.get("OLLAMA_UNIFY_INFERENCE_HOLD_FILE", "")
 DRAIN_TIMEOUT = env_float("OLLAMA_UNIFY_DRAIN_TIMEOUT", 300.0)
 PENDING_TIMEOUT = env_float("OLLAMA_UNIFY_PENDING_TIMEOUT", 300.0)
 UNLOAD_TIMEOUT = env_float("OLLAMA_UNIFY_UNLOAD_TIMEOUT", 120.0)
@@ -1890,6 +1891,32 @@ def gpu_health_snapshot(*, refresh: bool = False) -> dict[str, Any]:
         return dict(health)
 
 
+def inference_hold_status() -> dict[str, Any]:
+    """A persistent operator hold blocks model execution, not lease control."""
+    if not INFERENCE_HOLD_FILE:
+        return {"active": False}
+    try:
+        with open(INFERENCE_HOLD_FILE, encoding="utf-8") as stream:
+            reason = stream.read(512).strip()
+    except FileNotFoundError:
+        return {"active": False, "path": INFERENCE_HOLD_FILE}
+    except (OSError, UnicodeError) as exc:
+        reason = f"operator hold file cannot be read: {str(exc)[:160]}"
+    return {"active": True, "path": INFERENCE_HOLD_FILE,
+            "reason": reason or "operator manual inference control"}
+
+
+def require_inference_enabled(*, request_id: str = "",
+                              logical_request_id: str = "") -> None:
+    hold = inference_hold_status()
+    if hold["active"]:
+        raise PermanentCapacityError(
+            "Model inference is paused by the operator: " + hold["reason"],
+            503, "operator_inference_hold", request_id=request_id,
+            logical_request_id=logical_request_id,
+        )
+
+
 def require_gpu_health(*, request_id: str = "",
                        logical_request_id: str = "",
                        refresh: bool = False) -> None:
@@ -2088,6 +2115,7 @@ def discovery_document() -> dict[str, Any]:
         "selected_gpu_count": len(SELECTED_GPUS),
         "gpus": devices,
         "gpu_health": health,
+        "inference_hold": inference_hold_status(),
         "public_ollama_api": f"http://127.0.0.1:{LISTEN_PORT}",
         "ollama_backend": f"http://{BACKEND_HOST}:{BACKEND_PORT}",
         "control_socket": CONTROL_SOCKET,
@@ -2210,6 +2238,7 @@ def discovery_document() -> dict[str, Any]:
                     "model_not_installed",
                     "gpu_runtime_unavailable",
                     "gpu_recovery_required",
+                    "operator_inference_hold",
                     "gpu_health_unavailable",
                 "gpu_unregistered_workload",
                     "backend_start_failed",
@@ -4451,6 +4480,8 @@ class Broker:
         gpu_uuids: tuple[str, ...] | None = None,
         certified_lane_ids: set[str] | None = None,
     ) -> Lane | None:
+        if routable and model:
+            require_inference_enabled()
         self._prune_dead_lanes_locked()
         base = self.lanes["base"]
         blocked_gpus = self._ollama_blocked_gpus_locked()
@@ -4968,6 +4999,7 @@ class Broker:
                     reserved_mib_by_gpu: dict[str, int] | None = None,
                     expected_profile: Any = CONTEXT_PROFILE_UNSET,
                     reservation_operation: str = "") -> Lane:
+        require_inference_enabled()
         scope = (gpu_uuid,) if isinstance(gpu_uuid, str) else tuple(gpu_uuid)
         if not scope or len(set(scope)) != len(scope) or any(gpu not in SELECTED_GPUS for gpu in scope):
             raise PermanentCapacityError("invalid managed GPU scope", 422, "invalid_gpu_scope")
@@ -5408,6 +5440,7 @@ class Broker:
         triggered_by: dict[str, str] | None = None,
         *, allow_reclaim: bool = True, placement: str = "auto",
     ) -> dict[str, Any]:
+        require_inference_enabled()
         model = canonical_model_tag(model)
         if not model:
             raise PermanentCapacityError(
@@ -6386,6 +6419,9 @@ class Broker:
                     client: dict[str, str] | None = None) -> Admission:
         model = canonical_model_tag(model)
         request_id = request_id or secrets.token_hex(8)
+        if routable and model:
+            require_inference_enabled(request_id=request_id,
+                                      logical_request_id=logical_request_id)
         if warm_admission is not None and (not routable or not model or not POOL_ENABLED):
             raise PermanentCapacityError("warm admission requires managed inference", 400, "invalid_warm_admission")
         if routable and model and not allow_during_drain:
@@ -7962,6 +7998,7 @@ class Broker:
                 "pending_transition_timeout_seconds": PENDING_TIMEOUT,
                 "gpus": gpu_snapshot(),
                 "gpu_health": health,
+                "inference_hold": inference_hold_status(),
                 "parallel_pool": {
                     "enabled": POOL_ENABLED,
                     "max_managed_servers": POOL_MAX_SERVERS,
@@ -8391,6 +8428,12 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             return
         body = self.rfile.read(length) if length else b""
         content_type = self.headers.get("Content-Type", "")
+        if self.command == "POST" and (path in INFERENCE_PATHS or path == CAPACITY_PATH):
+            try:
+                require_inference_enabled()
+            except PermanentCapacityError as exc:
+                self._send_capacity_failure(exc)
+                return
         if self.command == "POST" and path == CAPACITY_PATH:
             try:
                 payload = json.loads(body or b"{}")
@@ -9420,7 +9463,7 @@ def main() -> int:
             document["active_leases"] = summaries
             # The daemon can have systemd EnvironmentFile overrides that the
             # CLI does not inherit. Publish its effective scope and health.
-            for key in ("selected_gpu_ids", "selected_gpu_count", "gpus", "gpu_health",
+            for key in ("selected_gpu_ids", "selected_gpu_count", "gpus", "gpu_health", "inference_hold",
                         "unregistered_gpu_quarantine", "lease_policy", "lease_handoff_requests"):
                 if key in live_status:
                     document[key] = live_status[key]
@@ -11660,6 +11703,11 @@ check_ollama_update() {
 
 reconcile_after_update() {
   banner
+  if [ -x /usr/local/sbin/ollama-version-guard ]; then
+    err "Ollama release reconciliation is managed by the host version guard. Run sudo ollama-version-guard ensure."
+    err "The broker and running Ollama have been left untouched."
+    return 2
+  fi
   [ "$HOST_SERVICE_MANAGER" = "systemd" ] \
     || { err "--reconcile requires a systemd host"; exit 2; }
   systemctl cat ollama.service >/dev/null 2>&1 \
@@ -11702,6 +11750,11 @@ reconcile_after_update() {
 
 update_ollama() {
   banner
+  if [ -x /usr/local/sbin/ollama-version-guard ]; then
+    err "Ollama upgrades are permission-gated on this host. Use ollama-version-guard approve/stage/activate with explicit operator permission."
+    err "The broker and running Ollama have been left untouched."
+    return 2
+  fi
   [ "$HOST_SERVICE_MANAGER" = "systemd" ] \
     || { err "--update-ollama requires a systemd host"; exit 2; }
   [ "$HAS_CURL" = 1 ] || { err "curl is required to download an Ollama update"; exit 2; }
@@ -11770,6 +11823,12 @@ render_reconcile_helper() {
 # the negotiator already owns. This helper re-asserts the pin and restarts the
 # pair in the only safe order: proxy down, backend up, proxy up.
 set -euo pipefail
+
+# A host version guard owns release admission and rollback. Never accept an
+# out-of-band executable as a new baseline or restart GPU services around it.
+if [ -x /usr/local/sbin/ollama-version-guard ]; then
+  exec /usr/local/sbin/ollama-version-guard ensure
+fi
 
 STATE="/usr/local/share/ollama-unify/state.env"
 DROPIN="/etc/systemd/system/ollama.service.d/zzz-ollama-unify-safety.conf"
