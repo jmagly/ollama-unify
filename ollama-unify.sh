@@ -1381,6 +1381,7 @@ OLLAMA_BINARY = os.environ.get("OLLAMA_UNIFY_OLLAMA_BINARY", "/usr/local/bin/oll
 OLLAMA_MODELS = os.environ.get("OLLAMA_UNIFY_MODELS", "")
 OLLAMA_CHILD_HOME = os.environ.get("OLLAMA_UNIFY_CHILD_HOME", "/var/lib/ollama-unify")
 LOG = logging.getLogger("ollama-unify-negotiator")
+CAPACITY_IO_DEADLINE = threading.local()
 
 HOP_HEADERS = {
     "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
@@ -1587,13 +1588,44 @@ def clamp_request(path: str, content_type: str, body: bytes) -> bytes:
 def backend_json_at(host: str, port: int, method: str, path: str,
                     payload: dict[str, Any] | None = None,
                     timeout: float = 10.0) -> dict[str, Any]:
+    deadline = getattr(CAPACITY_IO_DEADLINE, "deadline", None)
+    if deadline is not None:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise BackgroundCapacityDeferred("speculative cold capacity time budget expired")
+        timeout = min(timeout, remaining)
     body = None if payload is None else json.dumps(payload).encode()
     headers = {} if body is None else {"Content-Type": "application/json"}
     conn = http.client.HTTPConnection(host, port, timeout=timeout)
     try:
         conn.request(method, path, body=body, headers=headers)
+        if deadline is not None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise BackgroundCapacityDeferred("speculative cold capacity time budget expired")
+            if conn.sock is not None:
+                conn.sock.settimeout(min(timeout, remaining))
         response = conn.getresponse()
-        data = response.read()
+        if deadline is None:
+            data = response.read()
+        else:
+            chunks = []
+            # HTTPConnection drops its socket on close-delimited responses.
+            # The response still owns it, and must retain the absolute budget.
+            sock = conn.sock or getattr(getattr(response.fp, "raw", None), "_sock", None)
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise BackgroundCapacityDeferred("speculative cold capacity time budget expired")
+                if sock is not None:
+                    sock.settimeout(min(timeout, remaining))
+                chunk = response.read1(65536)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                if response.isclosed():
+                    break
+            data = b"".join(chunks)
         if response.status >= 400:
             raise BackendHTTPError(method, path, response.status, data)
         return json.loads(data or b"{}")
@@ -3252,6 +3284,7 @@ class QueuedRequest:
     client: dict[str, str] | None = None
     warm_admission: str | None = None
     cpu_offload: bool = False
+    cold_capacity_retry_at: float = 0.0
 
     def public_summary(self, position: int, now: float) -> dict[str, Any]:
         return {
@@ -5253,6 +5286,9 @@ class Broker:
             env["OLLAMA_MODELS"] = OLLAMA_MODELS
         LOG.info("managed lane starting id=%s gpu=%s model=%s port=%s",
                  lane_id, gpu_uuid, model, port)
+        capacity_deadline = getattr(CAPACITY_IO_DEADLINE, "deadline", None)
+        if capacity_deadline is not None and time.monotonic() >= capacity_deadline:
+            raise BackgroundCapacityDeferred("speculative cold capacity time budget expired before startup")
         startup_read = startup_write = None
         command = [OLLAMA_BINARY, "serve"]
         if reservation_operation:
@@ -5311,7 +5347,8 @@ class Broker:
                 finally:
                     os.close(startup_write)
             self.cv.notify_all()
-        deadline = time.monotonic() + POOL_READY_TIMEOUT
+        deadline = min(time.monotonic() + POOL_READY_TIMEOUT,
+                       capacity_deadline if capacity_deadline is not None else float("inf"))
         try:
             server_identity = managed_server_identity(process)
             while time.monotonic() < deadline:
@@ -7193,9 +7230,96 @@ class Broker:
                         )
                 self.cv.wait(min(remaining, 0.25))
 
+    def _disjoint_cold_waiter_locked(self, now: float) -> tuple[QueuedRequest, tuple[str, ...]] | None:
+        self._prune_stale_waiters_locked(now)
+        if (self.draining or self._global_transition_lease_locked()
+                or now >= self.reconcile_retry_at):
+            return None
+        head = next((item for item in self.waiters if item.warm_admission is None), None)
+        if head is None or head.last_reason_code not in (
+            "gpu_peer_group_wait", "gpu_peer_group_reserved", "lease_transition",
+            "lane_capacity_wait", "reclaimable_placement_wait",
+        ):
+            return None
+        self._prune_dead_lanes_locked()
+        managed_count = sum(lane.kind == "managed" for lane in self.lanes.values())
+        protected: set[str] = set()
+        seen_models: set[str] = set()
+        for item in self.waiters:
+            try:
+                allowed = self._capacity_scope_locked(item.model, item.gpu_uuids, "auto",
+                    str((item.client or {}).get("key") or ""))
+            except PermanentCapacityError:
+                return None  # The ordinary owner resolves changed authority.
+            order = (list(allowed) if allowed is not None else list(dict.fromkeys(
+                MODEL_GPU_PREFERENCES.get(item.model, []) + list(SELECTED_GPUS))))
+            effective = tuple(gpu for gpu in order if gpu in SELECTED_GPUS)
+            disjoint = tuple(gpu for gpu in effective if gpu not in protected)
+            first_for_model = item.model not in seen_models
+            if (item is not head and first_for_model and disjoint
+                    and item.warm_admission is None and not item.cpu_offload
+                    and now >= item.cold_capacity_retry_at
+                    and (not item.attached or item.connected())
+                    and managed_count + len(seen_models) + 1 <= POOL_MAX_SERVERS):
+                return item, disjoint
+            seen_models.add(item.model)
+            protected.update(effective)
+        return None
+
+    def _reconcile_disjoint_cold_waiter(self) -> None:
+        """Use spare GPUs while a different model's admission is blocked.
+
+        Every older request retains its effective GPU scope and one server
+        slot. A speculative attempt cannot evict a lane, widen an allowlist,
+        enable CPU offload, or pass an older request for the same model.
+        """
+        with self.cv:
+            candidate = self._disjoint_cold_waiter_locked(time.monotonic())
+            if candidate is None:
+                return
+            selected, scope = candidate
+            selected.cold_capacity_retry_at = time.monotonic() + 2.0
+            selected.phase = "starting-server"
+            self.cv.notify_all()
+        # Never wait behind a lease transition just to do speculative work.
+        if not self.transition.acquire(blocking=False):
+            with self.cv:
+                if selected in self.waiters:
+                    selected.phase = "queued"
+            return
+        previous_deadline = getattr(CAPACITY_IO_DEADLINE, "deadline", None)
+        CAPACITY_IO_DEADLINE.deadline = time.monotonic() + 5.0
+        try:
+            # Original scope, logical fingerprint and ticket stay unchanged.
+            # This narrower scope applies only to non-reclaiming cold placement.
+            self.ensure_capacity(selected.model, 1, selected.request_path, scope,
+                                 triggered_by=selected.client, allow_reclaim=False,
+                                 cpu_offload=False)
+        except (CapacityError, OSError, RuntimeError, TimeoutError, ValueError, TypeError) as exc:
+            with self.cv:
+                if selected in self.waiters:
+                    selected.phase = "queued"
+                    selected.cold_capacity_retry_at = time.monotonic() + 30.0
+                self.cv.notify_all()
+            LOG.debug("speculative cold placement deferred model=%s: %s", selected.model, exc)
+            # The ordinary turn owns any terminal failure. A failed speculative
+            # load keeps existing process/VRAM cleanup guards and backs off.
+        else:
+            with self.cv:
+                if selected in self.waiters:
+                    selected.phase = "ready"
+                self.cv.notify_all()
+        finally:
+            if previous_deadline is None:
+                del CAPACITY_IO_DEADLINE.deadline
+            else:
+                CAPACITY_IO_DEADLINE.deadline = previous_deadline
+            self.transition.release()
+
     def capacity_reconciler(self) -> None:
         """One scheduler owns managed-lane creation and replacement."""
         while not self.stopping.is_set():
+            self._reconcile_disjoint_cold_waiter()
             with self.cv:
                 self._prune_stale_waiters_locked()
                 if (self.draining or self._global_transition_lease_locked()
@@ -7227,11 +7351,18 @@ class Broker:
                         "all selected GPUs are reserved by pending or revoking leases"
                     )
                     waiter.last_reason_code = "lease_transition"
-                    self.reconcile_retry_at = 0.0
+                    self.reconcile_retry_at = time.monotonic() + 5.0
                     self.reconcile_last_error = waiter.last_error
                     self.reconciling_model = None
-                    self.cv.wait(5.0)
+                    # Already queued cold work must get a scheduling pass even
+                    # when no new request/lease notification arrives.
+                    bypass_ready = self._disjoint_cold_waiter_locked(time.monotonic()) is not None
+                    self.cv.wait(0.01 if bypass_ready else 5.0)
                     continue
+                if waiter.phase == "waiting-lease":
+                    # A lease notification can make the head runnable before
+                    # its polling deadline; give its original owner priority.
+                    self.reconcile_retry_at = 0.0
                 model = waiter.model
                 placement_scope = self._policy_constraint_locked(model, client_scope)
                 if self._model_cancellation_in_progress_locked(model):

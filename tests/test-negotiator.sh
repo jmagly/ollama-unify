@@ -92,6 +92,8 @@ python3 "$repo_dir/tests/test-negotiator-preload-scope.py" \
   "$test_tmp/ollama-unify-gpu-negotiator" "$repo_dir/tests/fixtures/bin"
 python3 "$repo_dir/tests/test-negotiator-cpu-offload.py" \
   "$test_tmp/ollama-unify-gpu-negotiator" "$repo_dir/tests/fixtures/bin"
+python3 "$repo_dir/tests/test-negotiator-cold-bypass.py" \
+  "$test_tmp/ollama-unify-gpu-negotiator" "$repo_dir/tests/fixtures/bin"
 python3 -m py_compile "$repo_dir/tests/test-negotiator.py" \
   "$repo_dir/tests/test-negotiator-pool.py" "$repo_dir/tests/test-tray.py" "$repo_dir/tests/test-client-identity.py" \
   "$repo_dir/tests/test-negotiator-multi-gpu.py" \
@@ -99,6 +101,7 @@ python3 -m py_compile "$repo_dir/tests/test-negotiator.py" \
   "$repo_dir/tests/test-negotiator-model-footprint.py" \
   "$repo_dir/tests/test-negotiator-preload-scope.py" \
   "$repo_dir/tests/test-negotiator-cpu-offload.py" \
+  "$repo_dir/tests/test-negotiator-cold-bypass.py" \
   "$repo_dir/tests/fixtures/bin/ollama"
 "$test_tmp/ollama-unify-gpu-negotiator" self-test
 python3 "$repo_dir/tests/test-negotiator.py" \
