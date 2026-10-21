@@ -519,13 +519,17 @@ n.Broker._persist_cache_state_locked = persist
                 self.assertEqual(second['lease']['state'], 'pending')
                 self.assertEqual(len(starts(case)), 2)
 
-    def test_priority_without_stable_operation_id_cannot_use_legacy_eviction(self):
+    def test_ordinary_priority_metadata_does_not_enable_cache_evacuation(self):
         with harness() as case:
             self.assertEqual(case.capacity(p.MODEL, gpu_uuids=[GPUS[0]])[0], 200)
+            original = p.managed_lanes(case.status())[0]['id']
             result = acquire(case, operation='')
-            self.assertFalse(result['ok'], result)
+            self.assertTrue(result['ok'], result)
+            self.assertEqual(result['lease']['priority'], 10)
+            self.assertEqual(result['lease']['evacuation_id'], '')
             self.assertEqual(len(starts(case)), 1)
-            self.assertFalse(case.status()['leases'])
+            self.assertEqual(p.managed_lanes(case.status())[0]['id'], original)
+            self.assertEqual(p.managed_lanes(case.status())[0]['gpu_uuids'], [GPUS[0]])
             self.assertFalse(case.status()['cache_residency']['operations'])
 
     def test_supported_cli_configures_and_requests_evacuating_lease(self):

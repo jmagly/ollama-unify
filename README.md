@@ -221,6 +221,71 @@ To preserve a running workload while upgrading a legacy host-wide lease, use `do
 
 Use `docker gpu status` to see leases, drain state, loaded Ollama models, foreign CUDA processes, per-GPU memory, and Ollama cgroup memory. The original `ollama-unify-gpu-lease` command remains available when Docker CLI discovery is not applicable. `num_gpu` in the Ollama API means GPU-offloaded model layers—not the number of physical GPUs. The script keeps every selected accelerator visible; on a three-A100 host Ollama may dynamically use one, two, or all three.
 
+### Fixed GPU groups and flexible services
+
+An enabled GPU can still contain another workload. A lease records its owner,
+current placement and reserved capacity; it does not disable that card.
+The default `--placement fixed` reserves the exact `--gpu` set. Use it for a
+workload requiring a particular NVLink pair or another hardware constraint.
+It is never silently moved to different GPUs.
+
+A restartable service can explicitly opt into `--placement flexible`. Its
+repeated `--gpu` options are ordered **candidates**, and the broker assigns
+exactly one of them. The assigned UUID is returned in `lease.gpu_uuids` and is
+the only GPU made visible to its workers. Prefer the standalone GPU first to
+keep a bridged pair available:
+
+```bash
+docker gpu run --owner voice-service --placement flexible --priority 0 \
+  --gpu GPU-STANDALONE --gpu GPU-PAIR-A --gpu GPU-PAIR-B \
+  --vram-mib 45000 \
+  --drain-command '/srv/voice/gpu-control drain' \
+  --resume-command '/srv/voice/gpu-control resume' \
+  --ready-command '/srv/voice/gpu-control ready' \
+  -- /srv/voice/start-foreground
+
+# A separately started trainer requires this exact pair.
+docker gpu run --owner trainer --priority 100 \
+  --gpu GPU-PAIR-A --gpu GPU-PAIR-B --vram-mib 100000 \
+  --ready-command '/srv/trainer/ready' -- /srv/trainer/start-foreground
+```
+
+Priorities range from -1000 to 1000, default 0. A strictly higher-priority
+request may ask a flexible owner to relocate; equal-priority, fixed and
+non-cooperative legacy owners keep their reservations. The broker first
+reserves an eligible destination with verified capacity. The flexible
+supervisor stops new application work, finishes active requests through its
+drain hook, gracefully stops its own workers, and waits for their exit. The
+broker independently verifies that the source CUDA allocation has disappeared
+before changing the same lease to the reserved destination. Only after the
+workers restart there and pass readiness can the pinned requester proceed.
+No live CUDA context is retargeted, and relocation never forcibly kills a worker.
+
+The drain hook must prevent new requests and report success only when current
+work is safe to stop. A busy hook can return nonzero and be polled again. The
+resume hook reopens admission if the requesting client disconnects or times
+out before restart. Readiness must verify resident workers and reopen normal
+service admission after a successful restart. The child receives
+`OLLAMA_UNIFY_GPU_LEASE_SUPERVISED=1` and `OLLAMA_UNIFY_GPU_LEASE`; it must not
+acquire, heartbeat or release a second lease owned by the wrapper.
+
+Independent supervisors can use flexible `acquire`, inspect their heartbeat's
+`relocation` field, drain their workers, then call
+`docker gpu relocate TOKEN --handoff-id ID`. They must use the returned exact
+UUID and call `ready` after residency. Flexible scopes cannot be widened or
+retargeted through `scope`. Destinations and waiting intent are public without
+lease tokens. A broker restart cancels waiting intent, while committed lease
+placement and priority remain persisted. The existing heartbeat reconnect
+window preserves live owners during broker updates.
+If cancellation arrives during graceful stop, the supervisor reloads its
+original, still-reserved GPU through `prepare` and the normal health checks.
+
+If there is no safe destination, an owner is busy, or the bounded handoff
+expires, the broker does not grant overlapping ownership. A higher priority
+does not create VRAM or override a fixed owner's hardware requirements.
+Multi-GPU groups remain exclusive throughout peer traffic; another service
+cannot trigger model load/unload on one member while that group is active.
+
 ### Opt-in lower-priority cache evacuation
 
 An operator can declare broker-owned **idle singleton caches** movable and give
@@ -254,7 +319,9 @@ options and retains its normal readiness/heartbeat/child-exit lifecycle.
 Before growing an active allocation, use
 `docker gpu prepare TOKEN --priority 20 --evacuation-id voice-grow-002`, grow it,
 then call `ready TOKEN` again. A failed evacuation does not revoke the existing
-active lease. Supplying a priority without an evacuation ID is rejected.
+active lease. An evacuation ID explicitly requests copy-first managed-cache
+evacuation; an ordinary acquisition priority only participates in cooperative
+external-lease relocation and does not authorize cache eviction by itself.
 
 Priorities are integers from -1000 to 1000; only strictly lower-priority caches
 may move. The broker drains admitted work to completion, preserves queued and
