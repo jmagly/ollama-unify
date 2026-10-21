@@ -242,6 +242,47 @@ def test_model_gpu_policy_menu(tray):
     assert not [row for row in sub_row["rows"] if row["kind"] == "copy"]
 
 
+def test_client_gpu_policy_menu(tray):
+    status = status_fixture()
+    key = status["clients"][0]["key"]
+    for scope in (None, [GPU1], [GPU0, GPU2], []):
+        status["client_gpu_policy"] = {} if scope is None else {key: scope}
+        client = build(tray, status)["clients"][0]
+        (menu,) = client["submenus"]
+        toggles = {item["key"]: item for item in menu["toggles"]}
+        expected = [GPU0, GPU1, GPU2, GPU4] if scope is None else scope
+        assert [gpu for gpu, item in toggles.items() if item["active"]] == expected
+        assert all(item["enabled"] for item in toggles.values())
+        assert all(item["spec"]["request"]["client_key"] == key
+                   and item["spec"]["request"]["action"] == "set_client_gpu"
+                   for item in toggles.values())
+        if scope == [GPU1]:
+            assert toggles[GPU1]["spec"]["request"]["allowed"] is False
+            assert toggles[GPU2]["spec"]["request"]["allowed"] is True
+        if scope == []:
+            assert menu["title"] == "Allowed GPUs: none (paused)"
+            assert menu["actions"][0]["request"]["gpu_uuids"] is None
+            assert toggles[GPU0]["spec"]["request"]["gpu_uuid"] == GPU0
+            assert toggles[GPU0]["spec"]["request"]["allowed"] is True
+        rows = tray.menu_rows(build(tray, status))
+        row = next(row for row in rows if row["group"] == "clients")
+        submenu = next(row for row in row["rows"] if row["key"] == "client-gpus")
+        assert len([row for row in submenu["rows"] if row["kind"] == "toggle"]) == 4
+
+
+def test_saved_client_policy_remains_accessible(tray):
+    status = status_fixture()
+    configured = dict(status["clients"][0], key="app:paused", policy_only=True,
+                      last_seen=0, requests=0)
+    status["client_gpu_policy"] = {"app:paused": []}
+    status["clients"] = [dict(status["clients"][0], key=f"app:recent-{i}")
+                         for i in range(tray.CLIENT_MENU_LIMIT+2)] + [configured]
+    clients = build(tray, status)["clients"]
+    assert clients[0]["key"] == "app:paused"
+    assert "Saved GPU policy · no recent requests" in clients[0]["details"]
+    assert len(clients) == tray.CLIENT_MENU_LIMIT+1
+
+
 def test_single_device_host(tray):
     status = {
         "ok": True, "draining": False, "backend_available": True,
@@ -455,6 +496,31 @@ def test_open_menu_survives_updates(tray):
     assert [spec["request"]["gpu_uuids"] for spec in fired] == [[GPU0, GPU1]]
     assert gpu1["widget"].get_active() is False
 
+    # Client scopes use the same guarded check items, including removing the
+    # final GPU and enabling one again after a saved pause.
+    fired.clear()
+    restricted["client_gpu_policy"] = {"app:eval": [GPU1]}
+    app.render(build(tray, restricted))
+    client_slot = slot_for(app, "app:eval")
+    client_policy = slot_for(app, "client-gpus", client_slot["path"])
+    client_gpu1 = slot_for(app, GPU1, client_policy["path"])
+    assert client_gpu1["widget"].get_active() is True and fired == []
+    client_gpu1["widget"].activate()
+    assert len(fired) == 1 and fired[0]["request"] == {
+        "action": "set_client_gpu", "client_key": "app:eval",
+        "gpu_uuid": GPU1, "allowed": False,
+    }
+    assert client_gpu1["widget"].get_active() is True
+    restricted["client_gpu_policy"] = {"app:eval": []}
+    app.render(build(tray, restricted))
+    assert client_gpu1["widget"].get_active() is False and len(fired) == 1
+    client_gpu2 = slot_for(app, GPU2, client_policy["path"])
+    client_gpu2["widget"].activate()
+    assert len(fired) == 2 and fired[1]["request"] == {
+        "action": "set_client_gpu", "client_key": "app:eval",
+        "gpu_uuid": GPU2, "allowed": True,
+    }
+
     # The real GTK label, not only the pure helper, stays inside the monitor
     # budget and retains the unabridged value as a tooltip.
     oversized = build(tray, status_fixture())
@@ -494,6 +560,8 @@ def main():
     tray = load_tray(sys.argv[1])
     test_menu_model(tray)
     test_model_gpu_policy_menu(tray)
+    test_client_gpu_policy_menu(tray)
+    test_saved_client_policy_remains_accessible(tray)
     test_single_device_host(tray)
     test_units_and_timeouts(tray)
     test_labels_are_pixel_bounded(tray)

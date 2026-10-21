@@ -2212,6 +2212,8 @@ def discovery_document() -> dict[str, Any]:
                 ),
                 "retry_after_json_field": "retry_after_ms",
                 "reason_codes": [
+                    "client_gpu_disabled",
+                    "client_gpu_policy_conflict",
                     "queue_admission_timeout",
                     "queue_full",
                     "lease_transition",
@@ -3290,6 +3292,7 @@ class Broker:
         self.lease_handoff_requests: dict[str, dict[str, Any]] = {}
         # Operator allowlists of GPUs per model; absent means every GPU.
         self.model_gpu_policy: dict[str, list[str]] = self._load_model_policy()
+        self.client_gpu_policy, self.client_policy_labels = self._load_client_policy()
         self.cache_policies, self.evacuations = self._load_cache_state()
         self.draining = any(
             lease.state in ("pending", "active", "revoking") and not lease.gpu_uuids
@@ -3433,10 +3436,68 @@ class Broker:
         payload = {
             "schema": "io.ollama-unify.gpu-negotiator.model-gpu-policy.v1",
             "models": self.model_gpu_policy,
+            "clients": self.client_gpu_policy,
+            "client_labels": self.client_policy_labels,
         }
-        temp_path.write_text(json.dumps(payload, separators=(",", ":")) + "\n")
-        os.chmod(temp_path, 0o600)
+        with temp_path.open("w", encoding="utf-8") as stream:
+            os.chmod(temp_path, 0o600)
+            stream.write(json.dumps(payload, separators=(",", ":")) + "\n")
+            stream.flush()
+            os.fsync(stream.fileno())
         os.replace(temp_path, MODEL_POLICY_PATH)
+
+    def _load_client_policy(self) -> tuple[dict[str, list[str]], dict[str, str]]:
+        """Keep operator policies independent of expiring attribution history."""
+        try:
+            payload = json.loads(MODEL_POLICY_PATH.read_text())
+        except FileNotFoundError:
+            return {}, {}
+        # Invalid durable policy must not silently re-enable a paused client.
+        if not isinstance(payload, dict):
+            raise ValueError("invalid GPU policy document")
+        policies, labels = payload.get("clients", {}), payload.get("client_labels", {})
+        if not isinstance(policies, dict) or not isinstance(labels, dict):
+            raise ValueError("invalid client GPU policies")
+        if len(policies) > CLIENT_HISTORY_LIMIT:
+            raise ValueError("too many saved client GPU policies")
+        for key, gpus in policies.items():
+            if (not isinstance(key, str) or not key or len(key) > 512
+                    or any(ord(char) < 32 for char in key)
+                    or not isinstance(gpus, list)
+                    or any(not isinstance(gpu, str) or not gpu for gpu in gpus)):
+                raise ValueError("invalid saved client GPU policy")
+        return ({key: list(dict.fromkeys(gpus)) for key, gpus in policies.items()},
+                {key: clean_client_text(labels.get(key) or key)
+                 for key in policies})
+
+    def _client_gpu_constraint_locked(
+        self, client_key: str, gpu_uuids: tuple[str, ...] | None,
+    ) -> tuple[str, ...] | None:
+        allowed = self.client_gpu_policy.get(client_key)
+        if allowed is None:
+            return gpu_uuids
+        if not allowed:
+            raise PermanentCapacityError(
+                "GPU requests are paused for this client; select an allowed GPU to resume",
+                403, "client_gpu_disabled")
+        narrowed = (tuple(allowed) if gpu_uuids is None else
+                    tuple(gpu for gpu in gpu_uuids if gpu in allowed))
+        if not narrowed:
+            raise PermanentCapacityError(
+                "the request GPU scope does not overlap this client's allowed GPUs",
+                409, "client_gpu_policy_conflict")
+        return narrowed
+
+    def _reject_client_waiter_locked(self, waiter: QueuedRequest,
+                                     failure: PermanentCapacityError) -> None:
+        waiter.phase = "failed"
+        waiter.terminal_error = str(failure)
+        waiter.terminal_status = failure.status
+        waiter.terminal_reason_code = failure.reason_code
+        self._record_logical_tombstone_locked(
+            waiter.logical_request_id, waiter.request_id, failure.reason_code)
+        self.queue_rejected_total += 1
+        self._remove_waiter_locked(waiter)
 
     def _load_cache_state(self) -> tuple[dict, dict]:
         try:
@@ -3945,7 +4006,7 @@ class Broker:
         return tuple(gpu_uuid for gpu_uuid in gpu_uuids if gpu_uuid in allowed)
 
     def _capacity_scope_locked(self, model: str, gpu_uuids: tuple[str, ...] | None,
-                               placement: str) -> tuple[str, ...] | None:
+                               placement: str, client_key: str = "") -> tuple[str, ...] | None:
         parse_capacity_placement(placement)
         if placement == "exclusive_group":
             if (gpu_uuids is None or len(gpu_uuids) < 2
@@ -3955,9 +4016,10 @@ class Broker:
             if any(gpu not in SELECTED_GPUS for gpu in gpu_uuids):
                 raise PermanentCapacityError("exclusive_group contains an unselected GPU",
                                              422, "gpu_constraint_unavailable")
-        allowed = self._policy_constraint_locked(model, gpu_uuids)
+        client_scope = self._client_gpu_constraint_locked(client_key, gpu_uuids)
+        allowed = self._policy_constraint_locked(model, client_scope)
         if placement == "exclusive_group" and allowed != gpu_uuids:
-            raise PermanentCapacityError("model policy excludes a requested group member",
+            raise PermanentCapacityError("model or client policy excludes a requested group member",
                                          409, "gpu_policy_conflict")
         return allowed
 
@@ -4655,7 +4717,7 @@ class Broker:
 
     def warm_admission_proof(self, model: str, parallel: int,
                              gpu_uuids: tuple[str, ...] | None,
-                             placement: str = "auto") -> dict[str, Any]:
+                             placement: str = "auto", *, client_key: str = "") -> dict[str, Any]:
         """Inspect existing warm capacity only. Never load, grow, or refresh idle time."""
         model = canonical_model_tag(model)
         if not POOL_ENABLED or not model or gpu_uuids is None or parallel < 1:
@@ -4663,7 +4725,7 @@ class Broker:
                                          400, "invalid_warm_admission")
         with self.cv:
             blocked = self._ollama_blocked_gpus_locked()
-            allowed = self._capacity_scope_locked(model, gpu_uuids, placement)
+            allowed = self._capacity_scope_locked(model, gpu_uuids, placement, client_key)
             if placement == "exclusive_group" and parallel > POOL_INSTANCE_PARALLEL:
                 raise PermanentCapacityError("one exact exclusive group supports only its configured parallel slots",
                                              422, "parallel_exceeds_capacity")
@@ -5492,7 +5554,8 @@ class Broker:
         require_gpu_health(refresh=True)
         with self.cv:
             requested_gpu_uuids = gpu_uuids
-            gpu_uuids = self._capacity_scope_locked(model, gpu_uuids, placement)
+            gpu_uuids = self._capacity_scope_locked(
+                model, gpu_uuids, placement, str((triggered_by or {}).get("key") or ""))
             cancelling_request = self._model_cancellation_in_progress_locked(
                 model
             )
@@ -5534,6 +5597,15 @@ class Broker:
                 "pool_disabled",
             )
         with self.transition:
+            # A policy can change while this capacity request waits behind a
+            # lease transition. Recompute from the caller's original scope.
+            with self.cv:
+                gpu_uuids = self._capacity_scope_locked(
+                    model, requested_gpu_uuids, placement,
+                    str((triggered_by or {}).get("key") or ""))
+                if gpu_uuids == ():
+                    raise PermanentCapacityError("model policy excludes the request GPUs",
+                                                 409, "gpu_policy_conflict")
             profile_data = None
             with MODEL_CONTEXT_LOCK:
                 if AUTO_MODEL_CONTEXT or effective_model_context_profile(model):
@@ -6465,6 +6537,14 @@ class Broker:
         if routable and model:
             require_inference_enabled(request_id=request_id,
                                       logical_request_id=logical_request_id)
+            with self.cv:
+                client_scope = self._client_gpu_constraint_locked(
+                    str((client or {}).get("key") or ""), gpu_uuids)
+            if client_scope is not None and not POOL_ENABLED:
+                raise PermanentCapacityError(
+                    "client GPU policies require the managed Ollama lane pool",
+                    409, "pool_disabled", request_id=request_id,
+                    logical_request_id=logical_request_id)
         if warm_admission is not None and (not routable or not model or not POOL_ENABLED):
             raise PermanentCapacityError("warm admission requires managed inference", 400, "invalid_warm_admission")
         if routable and model and not allow_during_drain:
@@ -6480,7 +6560,7 @@ class Broker:
             )
         if routable and model and POOL_ENABLED:
             with self.cv:
-                narrowed = self._policy_constraint_locked(model, gpu_uuids)
+                narrowed = self._policy_constraint_locked(model, client_scope)
             if narrowed == ():
                 raise PermanentCapacityError(
                     f"model {model!r} is restricted to GPUs "
@@ -6756,6 +6836,12 @@ class Broker:
             with self.cv:
                 if waiter.terminal_error:
                     raise self._waiter_terminal_failure(waiter)
+                try:
+                    client_scope = self._client_gpu_constraint_locked(
+                        str((waiter.client or {}).get("key") or ""), waiter.gpu_uuids)
+                except PermanentCapacityError as exc:
+                    self._reject_client_waiter_locked(waiter, exc)
+                    raise self._waiter_terminal_failure(waiter) from exc
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     detail = f": {waiter.last_error}" if waiter.last_error else ""
@@ -6797,6 +6883,11 @@ class Broker:
                     try:
                         certified_ids = self._validate_warm_admission_locked(
                             waiter.warm_admission, model, waiter.gpu_uuids, phase="queue_validation")
+                        certified_ids = {lane_id for lane_id in certified_ids
+                                         if self.lanes[lane_id].allows(client_scope)}
+                        if not certified_ids:
+                            raise WarmPreflightRequired(phase="queue_validation",
+                                causes=("gpu_policy_mismatch",))
                     except WarmPreflightRequired as exc:
                         # Keep exact retained ownership until its ordinary TTL.
                         # A different certificate cannot widen an admitted job.
@@ -6819,7 +6910,7 @@ class Broker:
                     item.model == model for item in self.waiters[:waiter_index]
                 )
                 if not self.draining and next_for_model:
-                    lane = self._select_lane_locked(model, True, waiter.gpu_uuids, certified_ids)
+                    lane = self._select_lane_locked(model, True, client_scope, certified_ids)
                     if lane is not None:
                         waiter.phase = "generating"
                         retained_for_admission = waiter.retained_request
@@ -6873,8 +6964,14 @@ class Broker:
                 if waiter is None:
                     self.cv.wait(0.25)
                     continue
+                try:
+                    client_scope = self._client_gpu_constraint_locked(
+                        str((waiter.client or {}).get("key") or ""), waiter.gpu_uuids)
+                except PermanentCapacityError as exc:
+                    self._reject_client_waiter_locked(waiter, exc)
+                    continue
                 blocked_gpus = self._ollama_blocked_gpus_locked()
-                selected_gpus = set(waiter.gpu_uuids or SELECTED_GPUS)
+                selected_gpus = set(client_scope or SELECTED_GPUS)
                 if selected_gpus and selected_gpus.issubset(blocked_gpus):
                     # This state changes only when the lease changes. Repeated
                     # ensure_capacity calls cannot create a lane and previously
@@ -6908,8 +7005,7 @@ class Broker:
                 matching = [lane for lane in self.lanes.values()
                             if lane.kind == "managed" and lane.model == model
                             and lane.context_profile_matches()
-                            and (waiter.gpu_uuids is None
-                                 or lane.allows(waiter.gpu_uuids))
+                            and lane.allows(client_scope)
                             and not set(lane.scope).intersection(blocked_gpus)
                             and not lane.retiring and not lane.loading]
                 if any(lane.in_flight < lane.parallel for lane in matching):
@@ -7932,6 +8028,66 @@ class Broker:
                 "stopping_lanes": [lane.lane_id for lane in moved],
                 "retiring_lanes": retiring}
 
+    def set_client_gpus(self, client_key: str,
+                        gpu_uuids: list[str] | None) -> dict[str, Any]:
+        """Change future admission without interrupting active or shared lanes."""
+        if (not isinstance(client_key, str) or not client_key or len(client_key) > 512
+                or any(ord(char) < 32 or ord(char) == 127 for char in client_key)):
+            raise ValueError("client GPU policy requires a valid client key")
+        if gpu_uuids is not None and (
+                not isinstance(gpu_uuids, list)
+                or any(not isinstance(gpu, str) or not gpu for gpu in gpu_uuids)):
+            raise ValueError("gpu_uuids must be an array of UUIDs or null")
+        known = SELECTED_GPUS or [str(device.get("uuid")) for device in gpu_snapshot()]
+        allowed = None if gpu_uuids is None else list(dict.fromkeys(gpu_uuids))
+        if allowed is not None:
+            unknown = [gpu for gpu in allowed if gpu not in known]
+            if unknown:
+                raise ValueError(f"GPUs are not brokered here: {unknown}")
+            if allowed and set(allowed) == set(known):
+                allowed = None
+        with self.cv:
+            if (allowed is not None and client_key not in self.client_gpu_policy
+                    and len(self.client_gpu_policy) >= CLIENT_HISTORY_LIMIT):
+                raise ValueError("saved client GPU policy limit reached; clear an unused policy")
+            old_policy, old_labels = dict(self.client_gpu_policy), dict(self.client_policy_labels)
+            if allowed is None:
+                self.client_gpu_policy.pop(client_key, None)
+                self.client_policy_labels.pop(client_key, None)
+            else:
+                self.client_gpu_policy[client_key] = allowed
+                identity = self.clients.get(client_key, {}).get("identity", {})
+                self.client_policy_labels[client_key] = clean_client_text(
+                    identity.get("label") or self.client_policy_labels.get(client_key) or client_key)
+            try:
+                self._persist_model_policy_locked()
+            except OSError:
+                self.client_gpu_policy, self.client_policy_labels = old_policy, old_labels
+                raise
+            self.reconcile_retry_at = 0.0
+            self.cv.notify_all()
+        LOG.info("client GPU policy client=%s allowed=%s", client_key, allowed)
+        return {"ok": True, "client_key": client_key, "allowed_gpu_uuids": allowed,
+                "active_requests_unchanged": True}
+
+    def set_client_gpu(self, client_key: str, gpu_uuid: str,
+                       allowed: bool) -> dict[str, Any]:
+        """Atomically edit one checkbox without overwriting other pending clicks."""
+        known = SELECTED_GPUS or [str(device.get("uuid")) for device in gpu_snapshot()]
+        if not isinstance(gpu_uuid, str) or gpu_uuid not in known:
+            raise ValueError("GPU is not brokered here")
+        if not isinstance(allowed, bool):
+            raise ValueError("allowed must be a boolean")
+        if not isinstance(client_key, str):
+            raise ValueError("client GPU policy requires a valid client key")
+        with self.cv:
+            effective = set(self.client_gpu_policy.get(client_key, known))
+            if allowed:
+                effective.add(gpu_uuid)
+            else:
+                effective.discard(gpu_uuid)
+            return self.set_client_gpus(client_key, [gpu for gpu in known if gpu in effective])
+
     def stop_lane(self, lane_id: str, force: bool = False) -> dict[str, Any]:
         with self.cv:
             self._prune_dead_lanes_locked()
@@ -8072,6 +8228,12 @@ class Broker:
                 "requests": record["requests"], "models": dict(record["models"]),
                 "lanes": sorted(lanes, key=lambda usage: -usage["last_seen"]),
             })
+        for key in sorted(self.client_gpu_policy.keys() - self.clients.keys()):
+            summaries.append({
+                "key": key, "identity": {"key": key, "label": self.client_policy_labels[key]},
+                "first_seen": 0, "last_seen": 0, "expires_at": None,
+                "requests": 0, "models": {}, "lanes": [], "policy_only": True,
+            })
         return sorted(summaries, key=lambda summary: -summary["last_seen"])
 
     def heartbeat(self, token: str) -> dict[str, Any]:
@@ -8142,6 +8304,7 @@ class Broker:
             model_gpu_policy = {
                 model: list(gpus) for model, gpus in self.model_gpu_policy.items()
             }
+            client_gpu_policy = {key: list(gpus) for key, gpus in self.client_gpu_policy.items()}
             cache_residency = {"policies": json.loads(json.dumps(self.cache_policies)),
                 "operations": [self._evacuation_public(value) for value in self.evacuations.values()]}
             unregistered_gpus = sorted(self._unregistered_gpus_locked())
@@ -8186,6 +8349,7 @@ class Broker:
                     "max_clients_per_lane": LANE_CLIENT_LIMIT,
                 },
                 "model_gpu_policy": model_gpu_policy,
+                "client_gpu_policy": client_gpu_policy,
                 "cache_residency": cache_residency,
                 "foreign_gpu_processes": foreign_gpu_usage(), "models": backend.models,
                 "host_memory": host_memory_snapshot()}
@@ -8625,7 +8789,8 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                     raise ValueError("warm_admission_proof must be boolean")
                 if proof_only:
                     result = self.broker.warm_admission_proof(
-                        str(payload.get("model") or ""), parallel, gpu_uuids, placement)
+                        str(payload.get("model") or ""), parallel, gpu_uuids, placement,
+                        client_key=self._client_reference()["key"])
                 else:
                     result = self.broker.ensure_capacity(
                         str(payload.get("model") or ""), parallel, endpoint, gpu_uuids,
@@ -9246,6 +9411,15 @@ class ControlHandler(socketserver.StreamRequestHandler):
                         None if requested is None
                         else [str(value) for value in requested],
                     )
+                elif action == "set_client_gpus":
+                    if "gpu_uuids" not in request:
+                        raise ValueError("gpu_uuids is required; use null for all or [] for none")
+                    result = self.broker.set_client_gpus(
+                        request.get("client_key"), request["gpu_uuids"])
+                elif action == "set_client_gpu":
+                    result = self.broker.set_client_gpu(
+                        request.get("client_key"), request.get("gpu_uuid"),
+                        request.get("allowed"))
                 elif action == "stop_lane":
                     result = self.broker.stop_lane(
                         str(request.get("lane_id") or ""),
@@ -10365,8 +10539,45 @@ def lease_gpu_submenu(lease: dict[str, Any], leases: list[dict[str, Any]],
     }
 
 
+def client_gpu_submenu(client: dict[str, Any], policy: dict[str, list[str]],
+                       brokered: list[str], inventory: dict[str, dict[str, str]]
+                       ) -> dict[str, Any]:
+    key = str(client["key"])
+    allowed = policy.get(key)
+    effective = [gpu for gpu in brokered if allowed is None or gpu in allowed]
+    label = (client.get("identity") or {}).get("label", key)
+    actions = []
+    if allowed is not None:
+        actions.append(action("Allow all GPUs", {
+            "action": "set_client_gpus", "client_key": key, "gpu_uuids": None,
+        }))
+    if allowed != []:
+        actions.append(action("Pause GPU requests", {
+            "action": "set_client_gpus", "client_key": key, "gpu_uuids": [],
+        }))
+    return {
+        "key": "client-gpus",
+        "title": "Allowed GPUs: " + (
+            "all" if allowed is None else gpu_list(allowed, inventory)
+            if allowed else "none (paused)"),
+        "details": wrapped("", "Running requests finish. Queued and future requests "
+                           "use these GPUs, subject to model policy and reservations. "
+                           "Selecting none pauses new GPU requests."),
+        "toggles": [toggle(
+            gpu, gpu_toggle_label(gpu, inventory), gpu in effective, True,
+            action(f"{'Disallow' if gpu in effective else 'Allow'} "
+                   f"{gpu_name(gpu, inventory)} for {label}", {
+                       "action": "set_client_gpu", "client_key": key,
+                       "gpu_uuid": gpu, "allowed": gpu not in effective,
+                   }),
+        ) for gpu in brokered],
+        "actions": actions,
+    }
+
+
 def client_entry(client: dict[str, Any], lanes: list[dict[str, Any]],
-                 inventory: dict[str, dict[str, str]], now: float
+                 inventory: dict[str, dict[str, str]], now: float,
+                 policy: dict[str, list[str]], brokered: list[str],
                  ) -> dict[str, Any]:
     identity = client.get("identity") or {}
     live = {lane.get("id") for lane in lanes}
@@ -10386,10 +10597,10 @@ def client_entry(client: dict[str, Any], lanes: list[dict[str, Any]],
     ):
         if value:
             details += wrapped(f"{label}: ", str(value))
-    details.append(
+    details.append("Saved GPU policy · no recent requests" if client.get("policy_only") else (
         f"Requests: {client.get('requests')} · last "
         f"{age(now - float(client.get('last_seen') or now))}"
-    )
+    ))
     details += [
         f"Model: {model} · {count} req"
         for model, count in sorted((client.get("models") or {}).items(),
@@ -10411,6 +10622,7 @@ def client_entry(client: dict[str, Any], lanes: list[dict[str, Any]],
                   + (f" · {models}" if models else "")),
         "details": details,
         "actions": [],
+        "submenus": [client_gpu_submenu(client, policy, brokered, inventory)],
     }
 
 
@@ -10531,10 +10743,14 @@ def build_menu_model(
             )] if lane.get("model") else [],
         })
 
-    client_entries = [
-        client_entry(client, lanes, inventory, now)
-        for client in (status.get("clients") or [])[:CLIENT_MENU_LIMIT]
-    ]
+    client_policy = status.get("client_gpu_policy") or {}
+    clients = status.get("clients") or []
+    # Saved policies remain editable even after their attribution expires.
+    visible_clients = [client for client in clients if client.get("key") in client_policy]
+    visible_clients += [client for client in clients
+                        if client.get("key") not in client_policy][:CLIENT_MENU_LIMIT]
+    client_entries = [client_entry(client, lanes, inventory, now, client_policy, brokered)
+                      for client in visible_clients]
 
     gpu_entries = []
     for device in status.get("gpus") or []:

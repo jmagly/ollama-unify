@@ -492,6 +492,7 @@ On desktop hosts the installer adds a system tray indicator (`/usr/local/libexec
 - **Ollama lanes** — model, GPU, in-flight requests, and reserved VRAM, with *Stop lane* (idle lanes only) and *Force stop lane*.
 - **Allowed GPUs** — each lane has an *Allowed GPUs* submenu with a check item per brokered GPU. Toggling sets that model's GPU allowlist (`set_model_gpus` on the control socket, persisted next to the lease state). Placement and lane selection follow it, idle lanes on a newly disallowed GPU move at once, and busy lanes move after their requests finish. Requests whose own GPU constraint shares no GPU with the policy get `409 gpu_policy_conflict`. Allowing every GPU clears the policy.
 - **GPUs in lease** — each pending or active lease has a matching submenu that adds or removes GPUs from its scope through the broker's scope checks. GPUs held by other leases are shown but cannot be selected, and a lease's last GPU cannot be removed.
+- **Clients → Allowed GPUs** — select one or several GPUs for that client, allow all, or uncheck every GPU to pause new GPU requests. Active requests finish; queued and future requests follow the new selection without stopping shared lanes used by other clients. Model policies, explicit request scopes and lease reservations still apply. Multiple selections are an allowlist; they do not force a model to span every selected card. Selecting none returns a non-retryable `403 client_gpu_disabled` for new inference/capacity work and does not force CPU inference. Metadata remains available.
 
 Destructive actions ask for confirmation, and failures open a dialog that shows the broker's error. Release and prepare wait as long as the broker's configured drain, unload, and settle deadlines allow. The icon switches to a warning when a lease is pending, revoking, or overdue, when the broker is draining, or when the Ollama backend is down.
 
@@ -542,6 +543,22 @@ The broker records which application sends each request and which Ollama lane se
 - **Anything else** — the remote address and `User-Agent`.
 
 Only process names are recorded, never command lines, which can contain secrets. Client attribution is an expiring observability cache: `OLLAMA_UNIFY_CLIENT_HISTORY_TTL` defaults to 3600 seconds and is renewed automatically whenever that client sends a request. When activity stops, the top-level client record, its per-lane history, and each lane's *Used by* entry expire naturally. An in-flight request remains attributed even when it runs beyond the TTL, then becomes eligible for expiry after it exits. Broker status publishes `expires_at` on retained attribution rows and `client_history_policy` with the effective TTL and bounds. The cache keeps at most 256 clients (`OLLAMA_UNIFY_CLIENT_HISTORY_LIMIT`), 32 lanes per client (`OLLAMA_UNIFY_CLIENT_LANE_HISTORY_LIMIT`), and eight clients per lane. Broker status (`clients`) includes request counts per model and retained lane; each lane reports `triggered_by`, the client whose request started it, and its recent clients. The tray shows *Started for* and *Used by* in each lane's submenu, and a *Clients* section lists the 20 most recent applications with their identity and lanes.
+
+Client GPU policies persist independently of attribution history and daemon
+restarts. Configured clients remain in the indicator after their recent usage
+expires, so paused clients can be enabled again. The control socket accepts
+`{"action":"set_client_gpus","client_key":"app:NAME","gpu_uuids":["GPU-UUID"]}`;
+use `[]` to pause or `null` to clear the policy and allow all broker-selected
+GPUs. A disjoint explicit request returns `409 client_gpu_policy_conflict`;
+exact groups are never silently shrunk. Individual tray checkboxes use atomic
+per-GPU edits so rapid selections do not
+overwrite each other while the indicator waits for its next status refresh.
+The control request is
+`{"action":"set_client_gpu","client_key":"app:NAME","gpu_uuid":"GPU-UUID","allowed":false}`.
+Policies follow the existing client
+identity key, so applications sharing a declared name share that policy. Send
+distinct `X-Ollama-Unify-Client` names when applications need independent
+controls. This is cooperative placement, not an authentication boundary.
 
 ### Manual inference hold
 
