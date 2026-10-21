@@ -1400,6 +1400,7 @@ CAPACITY_PATH = "/.well-known/ollama-unify-gpu-negotiator/capacity"
 LOGICAL_REQUEST_HEADER = "X-Ollama-Unify-Logical-Request-Id"
 RESUME_REQUEST_HEADER = "X-Ollama-Unify-Resume-Request"
 GPU_UUIDS_HEADER = "X-Ollama-Unify-GPU-UUIDs"
+CPU_OFFLOAD_HEADER = "X-Ollama-Unify-CPU-Offload"
 WARM_ADMISSION_HEADER = "X-Ollama-Unify-Warm-Admission"
 WARM_ADMISSION_SCHEMA = "io.ollama-unify.warm-admission.v1"
 
@@ -2066,6 +2067,52 @@ def increased_foreign_gpu_usage(previous: dict[str, int],
     }
 
 
+def managed_cgroup_memory_headroom(
+    membership_path: Path = Path("/proc/self/cgroup"),
+    cgroup_root: Path = Path("/sys/fs/cgroup"),
+) -> dict[str, int | str]:
+    """Inspect the managed parent and every cgroup-v2 ancestor, not base Ollama.
+
+    The broker's children inherit this membership. Both high and max constrain
+    additional pageable memory. An unlimited cgroup still has a finite physical
+    host budget; missing or unreadable containment telemetry fails closed.
+    """
+    try:
+        memberships = [line[3:] for line in membership_path.read_text().splitlines()
+                       if line.startswith("0::")]
+        if len(memberships) != 1:
+            raise ValueError("no exact unified cgroup membership")
+        root = cgroup_root.resolve()
+        current = (root / memberships[0].lstrip("/")).resolve()
+        if not current.is_relative_to(root):
+            raise ValueError("invalid cgroup membership")
+        headroom = None
+        while True:
+            # The host cgroup root lacks these files. A namespace-mounted
+            # container root may expose real limits, which still constrain us.
+            if current == root and not any((current / name).exists()
+                    for name in ("memory.current", "memory.high", "memory.max")):
+                break
+            used = int((current / "memory.current").read_text().strip())
+            if used < 0:
+                raise ValueError("invalid cgroup memory usage")
+            for name in ("memory.high", "memory.max"):
+                value = (current / name).read_text().strip()
+                if value == "max":
+                    continue
+                limit = int(value)
+                if limit < 0:
+                    raise ValueError("invalid cgroup memory limit")
+                available = max(0, limit - used) // (1024 * 1024)
+                headroom = available if headroom is None else min(headroom, available)
+            if current == root:
+                break
+            current = current.parent
+        return {"managed_cgroup_headroom_mib": "max" if headroom is None else headroom}
+    except (OSError, ValueError):
+        return {"managed_cgroup_headroom_mib": "unknown"}
+
+
 def host_memory_snapshot() -> dict[str, int | str]:
     result: dict[str, int | str] = {}
     try:
@@ -2088,6 +2135,7 @@ def host_memory_snapshot() -> dict[str, int | str]:
             result[target] = int(value) if value.isdigit() else value
     except (FileNotFoundError, OSError, subprocess.SubprocessError, ValueError):
         pass
+    result.update(managed_cgroup_memory_headroom())
     return result
 
 
@@ -2198,6 +2246,13 @@ def discovery_document() -> dict[str, Any]:
                     "explicit_headers_override": True,
                 },
                 "gpu_uuids_header": GPU_UUIDS_HEADER,
+                "cpu_offload_header": CPU_OFFLOAD_HEADER,
+                "cpu_offload_capacity_field": "cpu_offload",
+                "cpu_offload_semantics": (
+                    "explicit allow header or boolean capacity opt-in; full GPU preferred; "
+                    "physical-scope overflow only, exclusive scoped GPUs and bounded pageable host memory; "
+                    "no CPU-only fallback or warm certificate"
+                ),
                 "warm_admission_header": WARM_ADMISSION_HEADER,
                 "warm_admission_schema": WARM_ADMISSION_SCHEMA,
                 "warm_admission_proof_only_capacity_field": "warm_admission_proof",
@@ -2938,6 +2993,8 @@ class Lane:
     openai_context_compatible: bool = True
     warm_generation_id: str = ""
     warm_runtime_identity: dict[str, Any] | None = None
+    cpu_offload: bool = False
+    host_reserved_mib: int = 0
 
     def context_profile_matches(self) -> bool:
         return self.context_profile == effective_model_context_profile(self.model)
@@ -2948,6 +3005,10 @@ class Lane:
 
     def allows(self, gpu_uuids: tuple[str, ...] | list[str] | None) -> bool:
         return gpu_uuids is None or set(self.scope).issubset(gpu_uuids)
+
+    def can_serve(self, gpu_uuids: tuple[str, ...] | None, cpu_offload: bool) -> bool:
+        return self.allows(gpu_uuids) and (not self.cpu_offload or (
+            cpu_offload and set(self.scope) == set(gpu_uuids if gpu_uuids is not None else SELECTED_GPUS)))
 
     @property
     def protected_scope(self) -> tuple[str, ...]:
@@ -2965,7 +3026,9 @@ class Lane:
                 gpu: self.reserved_mib for gpu in self.scope
             },
             "observed_vram_mib_by_gpu": self.observed_vram_mib_by_gpu,
-            "exclusive": len(self.scope) > 1,
+            "exclusive": len(self.scope) > 1 or self.cpu_offload,
+            "cpu_offload": self.cpu_offload,
+            "host_reserved_mib": self.host_reserved_mib,
             "state": "retiring" if alive and self.retiring else (
                 "loading" if alive and self.loading else "ready" if alive else "stopped"
             ),
@@ -3148,6 +3211,7 @@ class RetainedRequest:
     fingerprint: str
     gpu_uuids: tuple[str, ...] | None = None
     warm_admission: str | None = None
+    cpu_offload: bool = False
 
 
 @dataclass(frozen=True)
@@ -3187,6 +3251,7 @@ class QueuedRequest:
     resume_deadline: float | None = None
     client: dict[str, str] | None = None
     warm_admission: str | None = None
+    cpu_offload: bool = False
 
     def public_summary(self, position: int, now: float) -> dict[str, Any]:
         return {
@@ -3197,6 +3262,7 @@ class QueuedRequest:
             "request_path": self.request_path or None,
             "workload_class": self.workload_class,
             "queue_policy": self.queue_policy,
+            "cpu_offload": self.cpu_offload,
             "position": position,
             "ticket": self.queue_ticket,
             "phase": self.phase,
@@ -3234,6 +3300,7 @@ class ActiveRequest:
     # HTTPConnection drops .sock when a close-delimited response takes
     # ownership. Keep the exact transport so cancellation still reaches it.
     backend_socket: Any = field(default=None, repr=False)
+    cpu_offload: bool = False
     # Serialize the last client write against EOF/reset observation. Without
     # this per-request guard, a client that closes immediately after reading a
     # complete fixed-length body can race the handler's completion commit and
@@ -3253,6 +3320,7 @@ class Admission:
     retained_request: RetainedRequest | None = None
     warm_admission: str | None = None
     active_request: ActiveRequest | None = field(default=None, repr=False, compare=False)
+    cpu_offload: bool = False
 
 
 @dataclass(frozen=True)
@@ -3279,6 +3347,7 @@ class CompletedResponse:
     completed_at: float
     expires_at: float
     warm_admission: str | None = None
+    cpu_offload: bool = False
 
 
 class Broker:
@@ -4086,7 +4155,7 @@ class Broker:
         ignore_lane_ids: set[str] | None = None,
     ) -> set[str]:
         return {gpu for lane in self.lanes.values()
-                if lane.kind == "managed" and len(lane.scope) > 1
+                if lane.kind == "managed" and (len(lane.scope) > 1 or lane.cpu_offload)
                 and lane.lane_id != ignore_lane_id
                 and lane.lane_id not in (ignore_lane_ids or ())
                 for gpu in lane.protected_scope}
@@ -4335,6 +4404,7 @@ class Broker:
         self, logical_request_id: str, method: str, path: str,
         warm_admission: str | None = None,
         gpu_uuids: tuple[str, ...] | None = None,
+        cpu_offload: bool | None = None,
     ) -> tuple[RetainedRequest | None, CompletedResponse | None]:
         if not logical_request_id:
             raise PermanentCapacityError(
@@ -4349,6 +4419,9 @@ class Broker:
             self._raise_logical_tombstone_locked(logical_request_id)
             response = self.completed_responses.get(logical_request_id)
             if response is not None:
+                if cpu_offload is not None and cpu_offload != response.cpu_offload:
+                    raise PermanentCapacityError("resume CPU offload permission differs from original request", 409,
+                                                 "logical_request_conflict")
                 if warm_admission is not None and warm_admission != response.warm_admission:
                     raise PermanentCapacityError("resume warm certificate differs from original request", 409,
                                                  "logical_request_conflict")
@@ -4374,6 +4447,9 @@ class Broker:
             if active is not None:
                 _, request_id, queue_ticket = active
                 active_record = self.active_request_records.get(request_id)
+                if cpu_offload is not None and (active_record is None or cpu_offload != active_record.cpu_offload):
+                    raise PermanentCapacityError("resume CPU offload permission differs from original request", 409,
+                                                 "logical_request_conflict")
                 if warm_admission is not None and (active_record is None or warm_admission != active_record.warm_admission):
                     raise PermanentCapacityError("resume warm certificate differs from original request", 409,
                                                  "logical_request_conflict")
@@ -4411,6 +4487,9 @@ class Broker:
                     request_id=waiter.request_id,
                     logical_request_id=logical_request_id,
                 )
+            if cpu_offload is not None and cpu_offload != retained.cpu_offload:
+                raise PermanentCapacityError("resume CPU offload permission differs from retained request", 409,
+                                             "logical_request_conflict")
             if warm_admission is not None and warm_admission != retained.warm_admission:
                 raise PermanentCapacityError("resume warm certificate differs from retained request", 409,
                                              "logical_request_conflict")
@@ -4440,6 +4519,7 @@ class Broker:
         body_sha256: str,
         unavailable_reason: str | None = None,
         warm_admission: str | None = None,
+        cpu_offload: bool = False,
     ) -> None:
         if not logical_request_id:
             return
@@ -4498,6 +4578,7 @@ class Broker:
                 completed_at=now,
                 expires_at=now + COMPLETED_RESPONSE_TTL,
                 warm_admission=warm_admission,
+                cpu_offload=cpu_offload,
             )
             self.completed_responses[logical_request_id] = response
             self.completed_response_bytes += retained_bytes
@@ -4584,6 +4665,7 @@ class Broker:
         routable: bool,
         gpu_uuids: tuple[str, ...] | None = None,
         certified_lane_ids: set[str] | None = None,
+        cpu_offload: bool = False,
     ) -> Lane | None:
         if routable and model:
             require_inference_enabled()
@@ -4597,7 +4679,7 @@ class Broker:
                     if lane.kind == "managed" and lane.model == model
                     and (certified_lane_ids is None or lane.lane_id in certified_lane_ids)
                     and lane.context_profile_matches()
-                    and lane.allows(gpu_uuids)
+                    and lane.can_serve(gpu_uuids, cpu_offload)
                     and not set(lane.scope).intersection(blocked_gpus)
                     and not lane.loading
                     and not lane.retiring
@@ -4611,6 +4693,7 @@ class Broker:
                 gpu_uuid: index for index, gpu_uuid in enumerate(gpu_uuids or ())
             }
             return min(matching, key=lambda lane: (
+                lane.cpu_offload,
                 lane.in_flight,
                 preference_rank.get(lane.gpu_uuid, len(preference_rank)),
                 lane.created_at,
@@ -4628,6 +4711,8 @@ class Broker:
         return base if base.in_flight < base.parallel else None
 
     def _warm_runtime_identity_locked(self, lane: Lane) -> dict[str, Any]:
+        if lane.cpu_offload:
+            raise WarmPreflightRequired(causes=("native_gpu_residency_mismatch",))
         if lane.kind != "managed" or lane.retiring or lane.loading:
             raise WarmPreflightRequired(causes=("lane_unavailable",))
         if not lane.context_profile_matches():
@@ -5103,7 +5188,8 @@ class Broker:
                     triggered_by: dict[str, str] | None = None,
                     reserved_mib_by_gpu: dict[str, int] | None = None,
                     expected_profile: Any = CONTEXT_PROFILE_UNSET,
-                    reservation_operation: str = "") -> Lane:
+                    reservation_operation: str = "", *,
+                    cpu_offload: bool = False, host_reserved_mib: int = 0) -> Lane:
         require_inference_enabled()
         scope = (gpu_uuid,) if isinstance(gpu_uuid, str) else tuple(gpu_uuid)
         if not scope or len(set(scope)) != len(scope) or any(gpu not in SELECTED_GPUS for gpu in scope):
@@ -5122,6 +5208,12 @@ class Broker:
             lane_id = f"lane-{self.next_lane_id}"
             self.next_lane_id += 1
         env = os.environ.copy()
+        if cpu_offload:
+            # Pageable CPU model layers only. Presence enables these GGML
+            # flags even when the inherited value is the string "0".
+            for key in ("GGML_CUDA_ENABLE_UNIFIED_MEMORY", "GGML_CUDA_REGISTER_HOST",
+                        "LLAMA_ARG_N_GPU_LAYERS", "LLAMA_ARG_FIT_TARGET"):
+                env.pop(key, None)
         if len(scope) > 1:
             # These GGML flags are enabled by their presence, including a
             # value of "0". Keep layer splitting on the host-staged path;
@@ -5194,7 +5286,8 @@ class Broker:
                     reserved_mib_by_gpu=dict(reserved_mib_by_gpu or {scope[0]: required_mib}),
                     loading=True, context_profile=profile,
                     openai_context_compatible=MODEL_CONTEXT_RESOLUTIONS.get(model, {}).get(
-                        "openai_context_compatible", True))
+                        "openai_context_compatible", True),
+                    cpu_offload=cpu_offload, host_reserved_mib=host_reserved_mib)
         lane.triggered_by = triggered_by
         with self.cv:
             # Publish the entire reservation before warm-up can start peer
@@ -5244,6 +5337,10 @@ class Broker:
             warm_path, warm_payload = self._warm_request(
                 model, capabilities, request_path
             )
+            if cpu_offload:
+                # Match inference's automatic fitting even when an installed
+                # Modelfile carries a historical fixed-layer override.
+                warm_payload.setdefault("options", {})["num_gpu"] = -1
             if profile:
                 warm_payload["options"]["num_ctx"] = profile["context_length"]
             require_gpu_health(refresh=True)
@@ -5288,19 +5385,27 @@ class Broker:
                 raise PermanentCapacityError(
                     f"resolved context allocation exceeds its reserved budget: observed={math.ceil(size_vram / (1024 * 1024))} MiB reserved={required_mib} MiB",
                     503, "model_context_memory_exceeded")
-            if len(scope) > 1:
+            if len(scope) > 1 or cpu_offload:
                 total_size = resident_model.get("size")
                 if (isinstance(total_size, bool) or not isinstance(total_size, (int, float))
-                        or total_size <= 0 or size_vram < total_size):
+                        or total_size <= 0 or (not cpu_offload and size_vram < total_size)):
                     raise PermanentCapacityError(
                         "split model did not become fully GPU-resident", 503,
                         "gpu_runtime_unavailable")
+                if cpu_offload and math.ceil(max(0, total_size - size_vram) / (1024 * 1024)) > host_reserved_mib:
+                    raise PermanentCapacityError(
+                        "CPU model allocation exceeds its reserved host budget", 503,
+                        "model_context_memory_exceeded")
                 observed = process_gpu_usage(process)
                 lane.observed_vram_mib_by_gpu = observed
                 if set(observed) != set(scope) or any(used <= 0 for used in observed.values()):
                     raise CapacityError(
                         f"managed GPU placement differs from reserved group: expected={list(scope)} observed={observed}",
                         503, "gpu_placement_unverified")
+                if cpu_offload and any(used > lane.reserved_mib_by_gpu[gpu]
+                                       for gpu, used in observed.items()):
+                    raise PermanentCapacityError("GPU allocation exceeds its reservation", 503,
+                                                 "model_context_memory_exceeded")
                 require_gpu_health(refresh=True)
                 self._require_safe_gpu_transition(scope, lane_id)
             with self.cv:
@@ -5416,6 +5521,114 @@ class Broker:
             )
         return [lane.lane_id for lane in lanes]
 
+    def _require_cpu_host_budget(self, requested_mib: int) -> None:
+        """Conservatively reserve the whole estimate, not a guessed layer split.
+
+        Existing promises are subtracted even when already resident, so delayed
+        paging cannot double spend host capacity. This deliberately favors safe
+        deferral over optimistic admission near memory/cgroup limits.
+        """
+        snapshot = host_memory_snapshot()
+        available = snapshot.get("memavailable_mib")
+        cgroup = snapshot.get("managed_cgroup_headroom_mib", "unknown")
+        if type(available) is not int or available <= 0 or cgroup == "unknown":
+            raise CapacityError("CPU offload requires verified host and managed cgroup memory budgets",
+                                reason_code="host_memory_unavailable")
+        if cgroup != "max":
+            if type(cgroup) is not int or cgroup < 0:
+                raise CapacityError("managed cgroup memory budget is unavailable",
+                                    reason_code="host_memory_unavailable")
+            available = min(available, cgroup)
+        with self.cv:
+            promised = sum(max(POOL_HOST_RESERVE_MIB, lane.host_reserved_mib)
+                           for lane in self.lanes.values() if lane.kind == "managed")
+        if requested_mib + promised > available:
+            raise CapacityError(
+                f"CPU offload reserves {requested_mib} MiB host memory plus {promised} MiB "
+                f"existing promises, but only {available} MiB verified headroom is available",
+                reason_code="host_memory_unavailable")
+
+    def _ensure_cpu_offload_capacity(
+        self, model: str, parallel: int, required_mib: int,
+        capabilities: set[str], request_path: str,
+        gpu_uuids: tuple[str, ...] | None, triggered_by: dict[str, str] | None,
+        expected_profile: Any, *, allow_reclaim: bool,
+    ) -> dict[str, Any]:
+        """Own an exact exclusive GPU scope and conservative pageable RAM.
+
+        Called only after proving that the model cannot fit the allowed physical
+        aggregate. CPU-only inference and spilling around busy GPU owners are
+        never an alternate admission path.
+        """
+        if parallel > POOL_INSTANCE_PARALLEL:
+            raise PermanentCapacityError("one CPU-offload scope supports only its configured parallel slots",
+                                         422, "parallel_exceeds_capacity")
+        scope = tuple(gpu_uuids) if gpu_uuids is not None else tuple(
+            gpu for gpu in dict.fromkeys(MODEL_GPU_PREFERENCES.get(model, []) + list(SELECTED_GPUS))
+            if gpu in SELECTED_GPUS)
+        if not scope:
+            raise PermanentCapacityError("CPU offload requires at least one allowed GPU", 422,
+                                         "invalid_gpu_scope")
+        with self.cv:
+            self._prune_dead_lanes_locked()
+            blocked = self._ollama_blocked_gpus_locked() | self._reserved_gpus_locked()
+            existing = [lane for lane in self.lanes.values()
+                        if lane.kind == "managed" and lane.model == model and lane.cpu_offload
+                        and lane.scope == scope and lane.context_profile_matches()
+                        and not lane.loading and not lane.retiring
+                        and not set(lane.scope).intersection(blocked)]
+            if existing:
+                return {"ok": True, "schema": "io.ollama-unify.gpu-negotiator.capacity.v1",
+                        "requested_model": model, "canonical_model": model,
+                        "requested_parallel": parallel, "requested_cpu_offload": True,
+                        "requested_gpu_uuids": list(scope),
+                        "admitted_parallel": sum(lane.parallel for lane in existing),
+                        "lanes": [lane.public_summary() for lane in existing]}
+            if set(scope).intersection(blocked):
+                raise CapacityError("CPU offload GPU scope is reserved or unavailable",
+                                    reason_code="gpu_peer_group_wait")
+            queued_models = {waiter.model for waiter in self.waiters if waiter.model != model}
+            victims = [lane for lane in self.lanes.values() if lane.kind == "managed"
+                       and set(lane.protected_scope).intersection(scope)]
+            if any(lane.in_flight or lane.loading or lane.model in queued_models for lane in victims):
+                raise CapacityError("CPU offload GPU scope still has active owners",
+                                    reason_code="gpu_peer_group_wait")
+            if victims and not allow_reclaim:
+                raise BackgroundCapacityDeferred("background CPU offload yields before lane reclamation")
+            if len(self.lanes) - 1 - len(victims) + 1 > POOL_MAX_SERVERS:
+                raise CapacityError("managed lane limit reached for CPU offload")
+        host_reservation = required_mib + POOL_HOST_RESERVE_MIB
+        # Prove feasibility before disrupting any idle GPU owner.
+        self._require_cpu_host_budget(host_reservation)
+        inventory = {str(device["uuid"]): device for device in gpu_snapshot()}
+        if any(gpu not in inventory for gpu in scope):
+            raise CapacityError("CPU offload GPU telemetry is unavailable",
+                                reason_code="gpu_peer_group_wait")
+        with self.cv:
+            for lane in victims:
+                lane.retiring = True
+            self.cv.notify_all()
+        if self._stop_lanes(victims, "exclusive CPU offload placement"):
+            raise CapacityError("CPU offload scope retirement is incomplete", reason_code="lane_stop_failed")
+        self._require_safe_gpu_transition(scope)
+        inventory = {str(device["uuid"]): device for device in gpu_snapshot()}
+        if any(gpu not in inventory
+               or int(inventory[gpu].get("total_mib") or 0) <= POOL_VRAM_RESERVE_MIB
+               or int(inventory[gpu].get("free_mib") or 0)
+                   < int(inventory[gpu]["total_mib"]) - POOL_VRAM_RESERVE_MIB for gpu in scope):
+            raise CapacityError("CPU offload requires its complete GPU reservation to be free",
+                                reason_code="gpu_peer_group_wait")
+        self._require_cpu_host_budget(host_reservation)
+        lane = self._spawn_lane(model, scope, required_mib, capabilities, request_path,
+                                triggered_by, {gpu: int(inventory[gpu]["total_mib"]) for gpu in scope},
+                                expected_profile=expected_profile, cpu_offload=True,
+                                host_reserved_mib=host_reservation)
+        return {"ok": True, "schema": "io.ollama-unify.gpu-negotiator.capacity.v1",
+                "requested_model": model, "canonical_model": model,
+                "requested_parallel": parallel, "requested_cpu_offload": True,
+                "requested_gpu_uuids": list(scope), "admitted_parallel": lane.parallel,
+                "lanes": [lane.public_summary()]}
+
     def _ensure_group_capacity(
         self, model: str, parallel: int, required_mib: int,
         capabilities: set[str], request_path: str,
@@ -5441,6 +5654,7 @@ class Broker:
                 blocked = self._ollama_blocked_gpus_locked() | self._reserved_gpus_locked()
                 existing = [lane for lane in self.lanes.values()
                             if lane.kind == "managed" and lane.model == model
+                            and not lane.cpu_offload
                             and lane.context_profile_matches()
                             and len(lane.scope) > 1 and lane.allows(gpu_uuids)
                             and (not exact_group or lane.scope == gpu_uuids)
@@ -5457,7 +5671,7 @@ class Broker:
                 # its members from reclamation.
                 blocked |= {gpu for lane in self.lanes.values()
                             if lane.kind == "managed" and len(lane.scope) > 1
-                            and (lane.model == model or lane.in_flight or lane.loading
+                            and ((lane.model == model and not lane.cpu_offload) or lane.in_flight or lane.loading
                                  or lane.model in queued_models
                                  or set(lane.protected_scope).intersection(blocked))
                             for gpu in lane.protected_scope}
@@ -5517,6 +5731,10 @@ class Broker:
                 raise CapacityError("GPU group lacks live free VRAM after retirement",
                                     reason_code="gpu_peer_group_wait")
             available_host = int(host_memory_snapshot().get("memavailable_mib") or 0)
+            with self.cv:
+                cpu_promises = any(lane.host_reserved_mib for lane in self.lanes.values())
+            if cpu_promises:
+                self._require_cpu_host_budget(POOL_HOST_RESERVE_MIB)
             if available_host and available_host < POOL_HOST_RESERVE_MIB:
                 raise CapacityError("host memory unavailable for GPU group",
                                     reason_code="host_memory_unavailable")
@@ -5543,8 +5761,13 @@ class Broker:
         request_path: str = "",
         gpu_uuids: tuple[str, ...] | None = None,
         triggered_by: dict[str, str] | None = None,
-        *, allow_reclaim: bool = True, placement: str = "auto",
+        *, allow_reclaim: bool = True, placement: str = "auto", cpu_offload: bool = False,
     ) -> dict[str, Any]:
+        if type(cpu_offload) is not bool:
+            raise PermanentCapacityError("cpu_offload must be boolean", 400, "invalid_capacity_request")
+        if cpu_offload and placement != "auto":
+            raise PermanentCapacityError("CPU offload does not support exclusive_group certification", 400,
+                                         "invalid_capacity_request")
         require_inference_enabled()
         model = canonical_model_tag(model)
         if not model:
@@ -5651,7 +5874,7 @@ class Broker:
                             if lane.kind == "managed" and lane.model == model
                             and lane.context_profile_matches()
                             and not set(lane.scope).intersection(blocked) and not lane.retiring
-                            and not lane.loading and lane.allows(gpu_uuids)]
+                            and not lane.loading and lane.can_serve(gpu_uuids, cpu_offload)]
             desired_servers = math.ceil(parallel / POOL_INSTANCE_PARALLEL)
             if len(existing) < desired_servers:
                 with MODEL_CONTEXT_LOCK:
@@ -5672,6 +5895,11 @@ class Broker:
                     capacity = sum(max(0, int(device.get("total_mib") or 0))
                                    for device in selected_devices)
                     if required_mib > capacity or len(selected_devices) < 2:
+                        if cpu_offload:
+                            return self._ensure_cpu_offload_capacity(
+                                model, parallel, required_mib, capabilities, request_path,
+                                gpu_uuids, triggered_by, expected_profile,
+                                allow_reclaim=allow_reclaim)
                         raise PermanentCapacityError(
                             f"model {model!r} requires {required_mib} MiB per lane, "
                             f"but selected GPUs have {capacity} MiB combined physical capacity",
@@ -5684,6 +5912,10 @@ class Broker:
                 host = host_memory_snapshot()
                 available_host = int(host.get("memavailable_mib") or 0)
                 required_host = missing * POOL_HOST_RESERVE_MIB
+                with self.cv:
+                    cpu_promises = any(lane.host_reserved_mib for lane in self.lanes.values())
+                if cpu_promises:
+                    self._require_cpu_host_budget(required_host)
                 if available_host and available_host < required_host:
                     raise CapacityError(
                         f"{missing} new lane(s) reserve {required_host} MiB host memory, "
@@ -5707,7 +5939,7 @@ class Broker:
                     }
                     replaceable = sorted(
                         (lane for lane in managed
-                         if (lane.model != model
+                         if (lane.model != model or lane.cpu_offload
                              or (gpu_uuids is not None
                                  and not lane.allows(gpu_uuids)))
                          and lane.in_flight == 0
@@ -5816,13 +6048,13 @@ class Broker:
                             (
                                 lane for lane in self.lanes.values()
                                 if lane.kind == "managed"
-                                and (lane.model != model
+                                and (lane.model != model or lane.cpu_offload
                                      or (gpu_uuids is not None
                                          and not lane.allows(gpu_uuids)))
                                 and lane.in_flight == 0
                                 and not lane.loading
                                 and (bool(set(lane.scope).intersection(device_uuids))
-                                     or (len(lane.scope) > 1
+                                     or ((len(lane.scope) > 1 or lane.cpu_offload)
                                          and bool(set(lane.scope).intersection(group_candidate_gpus))
                                          and not set(lane.protected_scope).intersection(group_blocked)))
                                 and lane.model not in queued_models
@@ -5886,6 +6118,7 @@ class Broker:
             with self.cv:
                 lanes = [lane for lane in self._lane_summaries_locked()
                          if lane["kind"] == "managed" and lane["model"] == model
+                         and (cpu_offload or not lane.get("cpu_offload", False))
                          and (gpu_uuids is None
                               or set(lane["gpu_uuids"]).issubset(gpu_uuids))]
                 admitted = sum(
@@ -6531,7 +6764,15 @@ class Broker:
                     queue_policy: str = "wait",
                     gpu_uuids: tuple[str, ...] | None = None,
                     warm_admission: str | None = None,
-                    client: dict[str, str] | None = None) -> Admission:
+                    client: dict[str, str] | None = None,
+                    cpu_offload: bool = False) -> Admission:
+        if type(cpu_offload) is not bool:
+            raise PermanentCapacityError("cpu_offload must be boolean", 400, "invalid_admission_header")
+        if cpu_offload and warm_admission is not None:
+            raise PermanentCapacityError("CPU offload cannot use a full-GPU warm certificate", 400,
+                                         "invalid_warm_admission")
+        if cpu_offload and routable and not POOL_ENABLED:
+            raise PermanentCapacityError("CPU offload requires the managed Ollama pool", 409, "pool_disabled")
         model = canonical_model_tag(model)
         request_id = request_id or secrets.token_hex(8)
         if routable and model:
@@ -6666,6 +6907,7 @@ class Broker:
                         or waiter.model != model
                         or waiter.request_path != request_path
                         or waiter.gpu_uuids != gpu_uuids
+                        or waiter.cpu_offload != cpu_offload
                     ):
                         self.queue_duplicate_total += 1
                         raise PermanentCapacityError(
@@ -6799,6 +7041,7 @@ class Broker:
                     initial_position=len(self.waiters) + 1,
                     client=client,
                     warm_admission=warm_admission,
+                    cpu_offload=cpu_offload,
                 )
                 self.waiters.append(waiter)
                 if retained_request is not None:
@@ -6910,7 +7153,7 @@ class Broker:
                     item.model == model for item in self.waiters[:waiter_index]
                 )
                 if not self.draining and next_for_model:
-                    lane = self._select_lane_locked(model, True, client_scope, certified_ids)
+                    lane = self._select_lane_locked(model, True, client_scope, certified_ids, waiter.cpu_offload)
                     if lane is not None:
                         waiter.phase = "generating"
                         retained_for_admission = waiter.retained_request
@@ -6930,6 +7173,7 @@ class Broker:
                             waiter.logical_request_id,
                         )
                         self.active_request_records[waiter.request_id].warm_admission = waiter.warm_admission
+                        self.active_request_records[waiter.request_id].cpu_offload = waiter.cpu_offload
                         if waiter.logical_request_id:
                             self.logical_in_flight[waiter.logical_request_id] = (
                                 waiter.request_fingerprint,
@@ -6945,7 +7189,7 @@ class Broker:
                             waiter.initial_position,
                             waiter.queue_ticket,
                             retained_for_admission,
-                            waiter.warm_admission, active_request=active,
+                            waiter.warm_admission, active_request=active, cpu_offload=waiter.cpu_offload,
                         )
                 self.cv.wait(min(remaining, 0.25))
 
@@ -6989,6 +7233,7 @@ class Broker:
                     self.cv.wait(5.0)
                     continue
                 model = waiter.model
+                placement_scope = self._policy_constraint_locked(model, client_scope)
                 if self._model_cancellation_in_progress_locked(model):
                     waiter.phase = "waiting-request-cancellation"
                     waiter.last_error = (
@@ -7005,13 +7250,20 @@ class Broker:
                 matching = [lane for lane in self.lanes.values()
                             if lane.kind == "managed" and lane.model == model
                             and lane.context_profile_matches()
-                            and lane.allows(client_scope)
+                            and lane.can_serve(placement_scope, waiter.cpu_offload)
                             and not set(lane.scope).intersection(blocked_gpus)
                             and not lane.retiring and not lane.loading]
                 if any(lane.in_flight < lane.parallel for lane in matching):
                     waiter.phase = "ready"
                     self.cv.notify_all()
                     self.cv.wait(0.05)
+                    continue
+                if matching and all(lane.cpu_offload for lane in matching):
+                    # One exclusive scope has a fixed number of slots. More
+                    # callers queue for its release instead of requesting an
+                    # impossible second copy and permanently failing admission.
+                    waiter.phase = "queued"
+                    self.cv.wait(0.25)
                     continue
                 desired_parallel = sum(lane.parallel for lane in matching) + 1
                 maximum = POOL_MAX_SERVERS * POOL_INSTANCE_PARALLEL
@@ -7037,6 +7289,7 @@ class Broker:
                         waiter.workload_class == "background"
                         and waiter.queue_policy == "yield"
                     ),
+                    cpu_offload=waiter.cpu_offload,
                 )
                 with self.cv:
                     self.reconcile_retry_at = 0.0
@@ -8610,6 +8863,15 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             GPU_UUIDS_HEADER,
         )
 
+    def _requested_cpu_offload(self) -> bool:
+        if CPU_OFFLOAD_HEADER not in self.headers:
+            return False
+        values = self.headers.get_all(CPU_OFFLOAD_HEADER, [])
+        if len(values) != 1 or values[0].strip().lower() not in ("allow", "deny"):
+            raise PermanentCapacityError(f"{CPU_OFFLOAD_HEADER} must be allow or deny", 400,
+                                         "invalid_admission_header")
+        return values[0].strip().lower() == "allow"
+
     def _requested_warm_admission(self) -> str | None:
         if WARM_ADMISSION_HEADER not in self.headers:
             return None
@@ -8787,6 +9049,11 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 proof_only = payload.get("warm_admission_proof", False)
                 if type(proof_only) is not bool:
                     raise ValueError("warm_admission_proof must be boolean")
+                cpu_offload = payload.get("cpu_offload", False)
+                if type(cpu_offload) is not bool:
+                    raise ValueError("cpu_offload must be boolean")
+                if proof_only and cpu_offload:
+                    raise ValueError("CPU offload cannot use a full-GPU warm certificate")
                 if proof_only:
                     result = self.broker.warm_admission_proof(
                         str(payload.get("model") or ""), parallel, gpu_uuids, placement,
@@ -8796,6 +9063,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                         str(payload.get("model") or ""), parallel, endpoint, gpu_uuids,
                         triggered_by=self._client_reference(),
                         placement=placement,
+                        cpu_offload=cpu_offload,
                     )
                 self._send_json(200, result)
             except PermanentCapacityError as exc:
@@ -8834,6 +9102,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         queue_policy = "wait"
         retained_request = None
         gpu_uuids = None
+        cpu_offload = False
         warm_admission = None
         is_resume = False
         client_key = ""
@@ -8844,6 +9113,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 queue_policy,
             ) = self._requested_admission_controls(path)
             gpu_uuids = self._requested_gpu_uuids()
+            cpu_offload = self._requested_cpu_offload()
             warm_admission = self._requested_warm_admission()
             resume_header = self.headers.get(RESUME_REQUEST_HEADER, "").strip()
             if resume_header and resume_header.lower() != "true":
@@ -8869,7 +9139,8 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                         logical_request_id=logical_request_id,
                     )
                 retained_request, completed = self.broker.resume_request_lookup(
-                    logical_request_id, self.command, path, warm_admission, gpu_uuids
+                    logical_request_id, self.command, path, warm_admission, gpu_uuids,
+                    cpu_offload=cpu_offload if CPU_OFFLOAD_HEADER in self.headers else None,
                 )
                 if completed is not None:
                     self._send_completed_response(completed)
@@ -8896,6 +9167,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                         logical_request_id=logical_request_id,
                     )
                 gpu_uuids = retained_request.gpu_uuids
+                cpu_offload = retained_request.cpu_offload
                 warm_admission = retained_request.warm_admission
             else:
                 if warm_admission is not None:
@@ -8932,6 +9204,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                     + b"\0"
                     + ",".join(gpu_uuids or ()).encode()
                     + b"\0"
+                    + (b"cpu-offload-allow\0" if cpu_offload else b"")
                     + ((b"warm-admission\0" + warm_admission.encode() + b"\0")
                        if warm_admission is not None else b"")
                     + body
@@ -8952,6 +9225,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                         fingerprint=fingerprint,
                         gpu_uuids=gpu_uuids,
                         warm_admission=warm_admission,
+                        cpu_offload=cpu_offload,
                     )
             admission = self.broker.proxy_enter(
                 model, path in INFERENCE_PATHS, self._client_connected, request_id,
@@ -8967,6 +9241,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 gpu_uuids=gpu_uuids,
                 warm_admission=warm_admission,
                 client=self._client_reference(),
+                cpu_offload=cpu_offload,
             )
         except ClientDisconnected:
             return
@@ -9052,6 +9327,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 "x-ollama-unify-workload-class",
                 "x-ollama-unify-queue-policy",
                 "x-ollama-unify-gpu-uuids",
+                "x-ollama-unify-cpu-offload",
                 "x-ollama-unify-warm-admission",
             }
             headers = {key: value for key, value in self.headers.items()
@@ -9249,6 +9525,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                     body_sha256=response_digest.hexdigest(),
                     unavailable_reason=unavailable_reason,
                     warm_admission=admission.warm_admission,
+                    cpu_offload=admission.cpu_offload,
                 )
         except CapacityError as exc:
             self._send_capacity_failure(exc, request_id=admission.request_id,
