@@ -178,14 +178,38 @@ docker gpu run \
   -- docker compose up
 ```
 
-`--gpu` creates a scope that is exclusive against other external leases. While that reservation is pending or revoking, broker-owned Ollama lanes can continue only on other selected GPUs. After the workload calls `ready`, its CUDA footprint is stable, so the broker can place managed Ollama lanes in measured free VRAM on a single scoped GPU with the configured reserve margin. A scope with two or more GPUs is exclusive for its whole lifetime: the broker retires Ollama lanes on those GPUs at acquire and never places, loads, or reclaims lanes there until release. Multi-GPU owners (tensor parallel, NCCL, CUDA peer access) drive peer-to-peer traffic across NVLink/PCIe, and starting or killing a colocated Ollama lane during that traffic preceded a fatal NVLink Xid 74 and a host lockup that required a hard reboot. The workload must call `prepare` before later VRAM growth; that transition drains the affected capacity first. The wrapper gives the child exactly the scoped UUIDs through `CUDA_VISIBLE_DEVICES`, heartbeats its lease, and releases it after the foreground command stops. The declared MiB value validates that the selected devices have enough live free memory; it is not an enforceable fractional VRAM carve-out. Without an explicit GPU scope, the broker retains the conservative host-wide drain for compatibility because it cannot prove where the external process will allocate.
+A single `--gpu` with a positive `--vram-mib` reserves that many MiB, not the
+whole card. Any number of external leases can share that GPU when their combined
+budgets and existing Ollama lane promises fit its live available memory. Pending
+loads reserve their budgets immediately, so two loaders cannot spend the same
+free VRAM. Resident allocations are counted once; driver overhead and unrelated
+allocations remain unavailable. A fitting scoped lease does not drain unrelated
+requests, evict fitting lanes, or relocate an incumbent just because it holds a
+lease. The workload must stay inside its budget, including models and workspace.
+This is cooperative admission, not a kernel-enforced VRAM partition.
+
+Use `--exclusive` for a fixed single-GPU workload that requires dedicated
+placement. Multi-GPU peer scopes remain exclusive for their lifetime, protecting
+NVLink/NCCL traffic from concurrent lane churn. Zero/omitted VRAM budgets retain
+exclusive ownership against other external leases because the broker cannot
+safely reserve an unknown amount for sharing. Unscoped legacy leases retain a
+host-wide drain. Pending/revoking allocations still defer Ollama lane placement
+on their scopes; ready single-GPU owners may share capacity with managed lanes.
+
+The foreground wrapper sets the exact UUIDs in `CUDA_VISIBLE_DEVICES`, records
+its workload parent PID at readiness, heartbeats, and releases after the child
+exits. Independently supervised services should use `ready TOKEN --pid PID` to
+identify their CUDA process tree when multiple owners load concurrently. A plain
+`ready` remains supported; ambiguous process ownership is accounted conservatively
+and may require registering the PID before clean release. Register an already
+active owner's PID with the same ready command without restarting it.
 
 For workloads managed by another supervisor, use the explicit lifecycle:
 
-1. `token=$(docker gpu acquire --owner <name> --justification '<purpose>' --expected-duration <seconds> --gpu <uuid> --token-only)` — reserves the specified whole GPU. Add `--gpu` again for each additional device.
+1. `token=$(docker gpu acquire --owner <name> --justification '<purpose>' --expected-duration <seconds> --gpu <uuid> --vram-mib <total-MiB> --token-only)` — reserves a VRAM budget on that GPU. Add `--gpu` again for each additional device.
 2. Start the external workload with `CUDA_VISIBLE_DEVICES` set to exactly those UUIDs, then wait until its CUDA models are fully loaded.
-3. `docker gpu ready <token>` — marks the external allocation active and stable. Single-GPU scopes become eligible for live-free-VRAM Ollama placement; multi-GPU scopes stay exclusive; legacy unscoped leases reopen Ollama here.
-4. Before increasing the workload's VRAM use, call `prepare <token>`, resize it, then call `ready <token>` again.
+3. `docker gpu ready <token> --pid <workload-parent-pid>` — marks the external allocation active and stable. Single-GPU scopes become eligible for live-free-VRAM Ollama placement; multi-GPU scopes stay exclusive; legacy unscoped leases reopen Ollama here.
+4. Before increasing VRAM use, call `prepare <token>`; to grow beyond the current budget use `prepare <token> --vram-mib <new-total-MiB>`. Admission reserves the new total before allocation and refuses growth that would spend another owner's reservation. Resize, then call `ready <token> --pid <workload-parent-pid>` again.
 5. Stop the external workload, ensuring its CUDA allocation is gone, then call `release <token>` so Ollama can reload and expand.
 
 Lease registration requires a specific owner. A meaningful purpose
@@ -217,7 +241,7 @@ An explicit broker rejection still fails immediately. If the broker remains
 unavailable past the bounded window, `docker gpu run` terminates its child so
 the external CUDA allocation fails closed.
 
-To preserve a running workload while upgrading a legacy host-wide lease, use `docker gpu scope <token> --gpu <uuid> [--gpu <uuid> ...]`. The broker accepts the live transition only when all foreign CUDA growth since acquire is contained in the requested external-owner-exclusive scope and the scope can satisfy the original reservation. It then reopens measured free VRAM for broker-owned lanes without stopping the external process. Foreign CUDA on an unreserved GPU quarantines it without evicting resident weights.
+To preserve a running workload while upgrading a legacy host-wide lease, use `docker gpu scope <token> --gpu <uuid> [--gpu <uuid> ...]`. The broker accepts the live transition only when all foreign CUDA growth since acquire is contained in the requested compatible scope and the scope can satisfy the original reservation. It then reopens measured free VRAM for broker-owned lanes without stopping the external process. Foreign CUDA on an unreserved GPU quarantines it without evicting resident weights.
 
 Use `docker gpu status` to see leases, drain state, loaded Ollama models, foreign CUDA processes, per-GPU memory, and Ollama cgroup memory. The original `ollama-unify-gpu-lease` command remains available when Docker CLI discovery is not applicable. `num_gpu` in the Ollama API means GPU-offloaded model layers—not the number of physical GPUs. The script keeps every selected accelerator visible; on a three-A100 host Ollama may dynamically use one, two, or all three.
 

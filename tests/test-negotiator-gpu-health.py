@@ -140,10 +140,14 @@ class GpuHealthTests(unittest.TestCase):
             broker, '_persist_leases_locked'
         ), mock.patch.object(broker, 'stop_pool_lanes', return_value=[]) as stop, mock.patch.object(
             broker, '_unload_base_models', return_value=[]
-        ), mock.patch.object(n, 'gpu_snapshot', return_value=[]):
+        ), mock.patch.object(n, 'gpu_snapshot', return_value=[{
+            'uuid':'GPU-selected', 'total_mib':8192, 'free_mib':8192, 'used_mib':0,
+        }]), mock.patch.object(n, 'foreign_gpu_usage', return_value={}), mock.patch.object(
+            n, 'exclusive_cuda_contexts', return_value={}
+        ), mock.patch.object(n, 'running_models', return_value=[]):
             result = broker.prepare('scoped')
         self.assertEqual(result['lease']['state'], 'pending')
-        stop.assert_called_once_with('lease prepare', {'GPU-selected'})
+        stop.assert_not_called()  # The existing budget already fits; no lane needs eviction.
 
     def test_recovery_actions_block_and_preserve_request_identity(self):
         for action in ('Reset', 'Reboot', 'Drain P2P', 'Drain and Reset', '[Unknown Error]'):

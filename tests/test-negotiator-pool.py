@@ -1338,8 +1338,10 @@ def test_scoped_active_lease_shares_stable_vram_with_ollama(helper, fixture_bin)
             harness.socket_path, {"action": "prepare", "token": token}
         )
         assert prepared["lease"]["state"] == "pending"
-        assert prepared["stopped_lanes"]
-        assert managed_lanes(harness.status()) == []
+        assert prepared["stopped_lanes"] == []
+        assert [lane["id"] for lane in managed_lanes(harness.status())] == [
+            active_capacity["lanes"][0]["id"]
+        ]
 
         control(harness.socket_path, {"action": "ready", "token": token})
         released = control(

@@ -73,6 +73,8 @@ python3 "$repo_dir/tests/test-negotiator-client-policy.py" \
 python3 "$repo_dir/tests/test-negotiator-cancellation.py" "$test_tmp/ollama-unify-gpu-negotiator"
 python3 "$repo_dir/tests/test-negotiator-gpu-health.py" "$test_tmp/ollama-unify-gpu-negotiator"
 python3 "$repo_dir/tests/test-negotiator-lease-metadata.py" "$test_tmp/ollama-unify-gpu-negotiator"
+python3 "$repo_dir/tests/test-negotiator-shared-leases.py" \
+  "$test_tmp/ollama-unify-gpu-negotiator" "$repo_dir/tests/fixtures/bin"
 python3 "$repo_dir/tests/test-negotiator-inference-hold.py" "$test_tmp/ollama-unify-gpu-negotiator"
 python3 "$repo_dir/tests/test-negotiator-model-context.py" \
   "$test_tmp/ollama-unify-gpu-negotiator" "$repo_dir/tests/fixtures/bin"

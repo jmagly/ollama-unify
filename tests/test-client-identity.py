@@ -173,7 +173,8 @@ def test_failed_lane_stop_retains_reservation(negotiator):
         mock.patch.object(negotiator, "gpu_snapshot", lambda: [{
             "uuid": "GPU-test", "total_mib": 8192, "free_mib": 8192,
         }]),
-        mock.patch.object(negotiator, "foreign_gpu_usage", lambda: {}),
+        mock.patch.object(negotiator, "foreign_gpu_usage", lambda **_kwargs: {}),
+        mock.patch.object(negotiator, "exclusive_cuda_contexts", lambda: {}),
     ):
         failed = broker._stop_lanes([lane], "test failed process group")
         assert failed == [lane]

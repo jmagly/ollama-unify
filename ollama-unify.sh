@@ -2406,7 +2406,7 @@ def discovery_document() -> dict[str, Any]:
 
 
 def agent_instructions_text() -> str:
-    return """# Host CUDA negotiation\n\nThis host runs the ollama-unify GPU lease broker. Before creating, starting, or resizing any Docker/container/service deployment that uses CUDA:\n\n1. Run `docker gpu discover` and inspect the selected GPUs, active lease summaries, coordination warnings, and current policy.\n2. Launch long-running CUDA services with `docker gpu run --owner NAME --justification PURPOSE --expected-duration SECONDS --vram-mib MIB --gpu GPU_UUID --ready-command 'CHECK' -- COMMAND`. Repeat `--gpu` for each reserved device. The readiness check must pass only after CUDA models are resident.\n3. For an independently supervised service, use scoped `acquire --owner NAME --justification PURPOSE --expected-duration SECONDS --gpu GPU_UUID`, set the child's `CUDA_VISIBLE_DEVICES` to exactly the same UUIDs, load the CUDA models, call `ready`, call `prepare` before any VRAM growth, and call `release` only after freeing CUDA memory.\n4. Lease registration requires a specific owner. Provide --justification PURPOSE and --expected-duration SECONDS when setting up workloads to help other agents coordinate; these are recommendations, and missing metadata must not halt a basic deployment. Omitted purpose and release time remain unknown and do not affect heartbeat TTL. These fields and the GPU scope are visible to other local agents; tokens are not exposed in discovery. Review current lessees before acquiring.\n5. Pending and revoking scoped leases block their GPUs. After `ready`, the broker can place Ollama lanes in measured free VRAM on single-GPU scopes. Multi-GPU scopes stay exclusive until release: the broker retires Ollama lanes there at acquire and never places, loads, or reclaims lanes on them, because lane churn during peer-to-peer (NVLink/NCCL) traffic is unsafe. The active workload must call `prepare` before any VRAM growth. Unscoped leases retain a host-wide drain because placement cannot be proven. A revoked lease whose owner stops heartbeating is abandoned once the revoke deadline passes, and its scope returns to live placement, so always `release` rather than letting an owner exit.\n6. Never bypass the broker by assuming free VRAM from a static scan. Unregistered CUDA activity quarantines affected GPUs: broker model load/unload is deferred until it exits. This cannot prevent its initial allocation or replace cooperative leases.\n7. Ollama API `num_gpu` counts offloaded layers, not physical GPUs. Keep it automatic (`-1`).\n8. Clients that require exact Ollama placement must send an ordered hard allowlist as `gpu_uuids` on capacity requests and `X-Ollama-Unify-GPU-UUIDs` on inference requests. The broker uses the ordered intersection with its live selected GPUs, rejects an empty intersection, and never falls back outside the allowlist.\n9. Placement defaults to fixed: --gpu names the exact required set, including NVLinked pairs. Opt into --placement flexible only for a service whose supervisor can drain and restart; its --gpu options become ordered single-GPU candidates. Use --priority (default0, -1000..1000) to permit strictly higher-priority requests to ask flexible owners to relocate. The broker reserves a destination first and verifies source CUDA release; never change a live worker UUID. Generic run requires --drain-command; use --resume-command to reopen admission after cancelled handoffs. Independent owners read heartbeat.relocation, drain, call relocate TOKEN --handoff-id ID, start only on the returned UUID, then ready. Fixed/non-cooperative owners are never forcibly moved.\n\nMachine-readable discovery: `/usr/local/share/ollama-unify/gpu-negotiator.json` or `http://127.0.0.1:11434/.well-known/ollama-unify-gpu-negotiator`.\n"""
+    return """# Host CUDA negotiation\n\nThis host runs the ollama-unify GPU lease broker. Before creating, starting, or resizing any Docker/container/service deployment that uses CUDA:\n\n1. Run `docker gpu discover` and inspect the selected GPUs, active lease summaries, coordination warnings, and current policy.\n2. Launch long-running CUDA services with `docker gpu run --owner NAME --justification PURPOSE --expected-duration SECONDS --vram-mib MIB --gpu GPU_UUID --ready-command 'CHECK' -- COMMAND`. Repeat `--gpu` for each reserved device. The readiness check must pass only after CUDA models are resident.\n3. For an independently supervised service, use scoped `acquire --owner NAME --justification PURPOSE --expected-duration SECONDS --gpu GPU_UUID`, set the child's `CUDA_VISIBLE_DEVICES` to exactly the same UUIDs, load the CUDA models, call `ready`, call `prepare` before any VRAM growth, and call `release` only after freeing CUDA memory.\n4. Lease registration requires a specific owner. Provide --justification PURPOSE and --expected-duration SECONDS when setting up workloads to help other agents coordinate; these are recommendations, and missing metadata must not halt a basic deployment. Omitted purpose and release time remain unknown and do not affect heartbeat TTL. These fields and the GPU scope are visible to other local agents; tokens are not exposed in discovery. Review current lessees before acquiring.\n5. Positive --vram-mib single-GPU leases share memory when their combined promises and live usage fit; there is no lease-count cap. Zero-budget, explicit --exclusive and multi-GPU owners retain exclusive external scopes. Call prepare TOKEN --vram-mib NEW_TOTAL before exceeding the budget, and ready TOKEN --pid WORKLOAD_PID after allocation. The run wrapper registers its child automatically. Pending and revoking scoped leases defer Ollama placement. After `ready`, the broker can place Ollama lanes in measured free VRAM on single-GPU scopes. Multi-GPU scopes stay exclusive until release: the broker retires Ollama lanes there at acquire and never places, loads, or reclaims lanes on them, because lane churn during peer-to-peer (NVLink/NCCL) traffic is unsafe. The active workload must call `prepare` before any VRAM growth. Unscoped leases retain a host-wide drain because placement cannot be proven. A revoked lease whose owner stops heartbeating is abandoned once the revoke deadline passes, and its scope returns to live placement, so always `release` rather than letting an owner exit.\n6. Never bypass the broker by assuming free VRAM from a static scan. Unregistered CUDA activity quarantines affected GPUs: broker model load/unload is deferred until it exits. This cannot prevent its initial allocation or replace cooperative leases.\n7. Ollama API `num_gpu` counts offloaded layers, not physical GPUs. Keep it automatic (`-1`).\n8. Clients that require exact Ollama placement must send an ordered hard allowlist as `gpu_uuids` on capacity requests and `X-Ollama-Unify-GPU-UUIDs` on inference requests. The broker uses the ordered intersection with its live selected GPUs, rejects an empty intersection, and never falls back outside the allowlist.\n9. Placement defaults to fixed: --gpu names the exact required set, including NVLinked pairs. Opt into --placement flexible only for a service whose supervisor can drain and restart; its --gpu options become ordered single-GPU candidates. Use --priority (default0, -1000..1000) to permit strictly higher-priority requests to ask flexible owners to relocate. The broker reserves a destination first and verifies source CUDA release; never change a live worker UUID. Generic run requires --drain-command; use --resume-command to reopen admission after cancelled handoffs. Independent owners read heartbeat.relocation, drain, call relocate TOKEN --handoff-id ID, start only on the returned UUID, then ready. Fixed/non-cooperative owners are never forcibly moved.\n\nMachine-readable discovery: `/usr/local/share/ollama-unify/gpu-negotiator.json` or `http://127.0.0.1:11434/.well-known/ollama-unify-gpu-negotiator`.\n"""
 
 
 def foreign_usage_by_gpu(
@@ -2448,13 +2448,17 @@ def foreign_usage_at_or_below(
 def wait_for_foreign_settle(
     baseline: dict[str, int] | None = None,
     gpu_uuids: set[str] | None = None,
+    *, ignored_processes: set[str] | None = None,
 ) -> None:
+    def observed() -> dict[str, int]:
+        return {key: value for key, value in foreign_gpu_usage(strict=BACKEND_TYPE == "cuda").items()
+                if key not in (ignored_processes or set())}
     deadline = time.monotonic() + ANON_MAX_DRAIN
-    last = foreign_usage_by_gpu(foreign_gpu_usage(), gpu_uuids)
+    last = foreign_usage_by_gpu(observed(), gpu_uuids)
     stable_since = time.monotonic()
     while time.monotonic() < deadline:
         time.sleep(ANON_POLL)
-        current_raw = foreign_gpu_usage()
+        current_raw = observed()
         current = foreign_usage_by_gpu(current_raw, gpu_uuids)
         if current == last:
             if (time.monotonic() - stable_since >= ANON_SETTLE
@@ -2471,6 +2475,31 @@ def wait_for_foreign_settle(
         raise TimeoutError(
             "foreign GPU allocation did not return to its pre-lease baseline"
         )
+
+
+def workload_contains_pid(root: int, pid: int) -> bool:
+    """Follow parent IDs, never command lines or process environments."""
+    for _ in range(256):
+        if pid == root:
+            return True
+        if pid <= 1:
+            break
+        try:
+            pid = int((Path('/proc')/str(pid)/'stat').read_text().rsplit(')', 1)[1].split()[1])
+        except (OSError, ValueError, IndexError):
+            break
+    return False
+
+
+def wait_for_owned_cuda_exit(keys: list[str]) -> None:
+    deadline = time.monotonic() + ANON_MAX_DRAIN
+    while True:
+        live = foreign_gpu_usage(strict=BACKEND_TYPE == "cuda")
+        if not set(keys).intersection(live):
+            return
+        if time.monotonic() >= deadline:
+            raise TimeoutError("lease workload still has CUDA contexts; stop it before release")
+        time.sleep(ANON_POLL)
 
 
 CLIENT_HEADER = "X-Ollama-Unify-Client"
@@ -2756,9 +2785,12 @@ class Lease:
     placement: str = "fixed"
     priority: int = 0
     eligible_gpu_uuids: list[str] = field(default_factory=list)
+    exclusive: bool = False
+    cuda_processes: list[str] | None = None
+    capacity_mib: int = 0
 
 
-def lease_requires_exclusive_gpus(gpu_uuids: list[str]) -> bool:
+def lease_requires_exclusive_gpus(gpu_uuids: list[str], exclusive: bool = False) -> bool:
     """Return whether a scope must never host broker-owned Ollama lanes.
 
     A multi-GPU owner (tensor parallel, NCCL, CUDA peer access) moves data
@@ -2767,7 +2799,42 @@ def lease_requires_exclusive_gpus(gpu_uuids: list[str]) -> bool:
     preceded a fatal NVLink Xid 74 and a host lockup, so such scopes are
     exclusive for their whole lifetime, not only while pending.
     """
-    return len(gpu_uuids) > 1
+    return exclusive or len(gpu_uuids) > 1
+
+
+def exclusive_cuda_contexts() -> dict[str, int]:
+    """Enumerate ALL CUDA contexts, including canonical/base/orphan runners.
+
+    Ordinary foreign accounting intentionally excludes managed processes. An
+    explicit private scope may be granted or released only when even those
+    contexts are absent, so this query must not use that classification.
+    """
+    try:
+        result = subprocess.run([
+            "nvidia-smi", "--query-compute-apps=pid,gpu_uuid,used_gpu_memory",
+            "--format=csv,noheader,nounits",
+        ], check=True, capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise RuntimeError("cannot verify exclusive CUDA contexts") from exc
+    contexts: dict[str, int] = {}
+    for row in result.stdout.splitlines():
+        if not row.strip():
+            continue
+        fields = [field.strip() for field in row.split(",")]
+        if (len(fields) != 3 or not re.fullmatch(r"[0-9]{1,20}", fields[0])
+                or int(fields[0]) <= 0 or not fields[1]
+                or not re.fullmatch(r"[0-9]{1,20}", fields[2])):
+            raise RuntimeError("invalid exclusive CUDA context telemetry")
+        contexts[f"{int(fields[0])}@{fields[1]}"] = int(fields[2])
+    return contexts
+
+
+
+def require_exclusive_cuda_free(gpu_uuids: list[str]) -> None:
+    """Require no CUDA context of any ownership before granting/releasing a scope."""
+    scope = set(gpu_uuids)
+    if any(key.rsplit("@", 1)[-1] in scope for key in exclusive_cuda_contexts()):
+        raise RuntimeError("exclusive GPU scope still has CUDA contexts")
 
 
 LEASE_COORDINATION_WARNING = (
@@ -2779,6 +2846,13 @@ LEASE_COORDINATION_WARNING = (
 
 def lease_policy_document() -> dict[str, Any]:
     return {
+        "sharing": {
+            "single_gpu": "positive VRAM budgets share capacity; no lease-count limit",
+            "capacity": "live free VRAM and all outstanding lease/lane promises",
+            "unknown_budget": "zero remains exclusive against other external owners",
+            "growth": "prepare --vram-mib NEW_TOTAL before growing beyond the budget",
+            "readiness": "ready --pid WORKLOAD_PID disambiguates concurrent CUDA loaders",
+        },
         "cooperative_handoff": {
             "schema": "io.ollama-unify.cooperative-handoff.v1",
             "opt_in_acquire_flag": "--yield-on-request",
@@ -2850,6 +2924,7 @@ def lease_public_summary(
         )
     return {
         "owner": str(raw.get("owner") or "unknown"),
+        "exclusive": lease_requires_exclusive_gpus(raw.get("gpu_uuids") or [], raw.get("exclusive") is True),
         "yield_on_request": raw.get("yield_on_request") is True,
         "placement": raw.get("placement", "fixed"),
         "priority": int(raw.get("priority") or 0),
@@ -2860,6 +2935,9 @@ def lease_public_summary(
             if isinstance(value, str)
         ],
         "requested_mib": max(0, int(raw.get("requested_mib") or 0)),
+        "sharing": ("shared" if len(raw.get("gpu_uuids") or []) == 1
+                    and not raw.get("exclusive") and int(raw.get("requested_mib") or 0) > 0
+                    else "exclusive"),
         "justification": justification or "not provided",
         "created_at": float(raw.get("created_at") or 0),
         "expected_release_at": expected_release_at or None,
@@ -3467,6 +3545,8 @@ class Broker:
         now = time.time()
         leases: dict[str, Lease] = {}
         for raw in raw_leases:
+            if isinstance(raw, dict) and type(raw.get("exclusive", False)) is not bool:
+                raise RuntimeError("invalid persisted exclusive lease flag; refusing to discard reservations")
             try:
                 created_at = float(raw["created_at"])
                 state = str(raw["state"])
@@ -3483,6 +3563,10 @@ class Broker:
                     if isinstance(baseline_raw, dict) else None
                 )
                 lease = Lease(
+                    exclusive=raw.get("exclusive", False),
+                    cuda_processes=([str(key) for key in raw["cuda_processes"]]
+                                    if isinstance(raw.get("cuda_processes"), list) else None),
+                    capacity_mib=max(0, int(raw.get("capacity_mib") or 0)),
                     token=str(raw["token"]), owner=str(raw["owner"]),
                     state=state, requested_mib=max(0, int(raw["requested_mib"])),
                     created_at=created_at, heartbeat_at=float(raw["heartbeat_at"]),
@@ -4242,8 +4326,8 @@ class Broker:
         check fits. Active multi-GPU scopes stay blocked: lane churn there
         runs concurrently with the owner's peer-to-peer traffic.
 
-        `_reserved_gpus_locked` remains the stricter lease-to-lease exclusion
-        set. Two external owners never share a scoped GPU.
+        Bounded single-GPU external owners can share the GPU's VRAM budget.
+        Pending transitions still defer Ollama lane churn until ready.
         """
         return (self._unregistered_gpus_locked() | self._lease_blocked_gpus_locked()
                 | self._evacuation_recovery_scopes_locked()
@@ -4259,7 +4343,7 @@ class Broker:
             for gpu_uuid in lease.gpu_uuids
             if lease.state in ("pending", "revoking")
             or (lease.state == "active"
-                and lease_requires_exclusive_gpus(lease.gpu_uuids))
+                and lease_requires_exclusive_gpus(lease.gpu_uuids, lease.exclusive))
         }
 
     def _global_transition_lease_locked(self) -> Lease | None:
@@ -4274,9 +4358,10 @@ class Broker:
 
     def _plan_lease_gpus(
         self, requested_mib: int, requested_gpu_uuids: list[str],
-        handoff_id: str = "",
+        handoff_id: str = "", *, exclusive: bool = False,
+        ignore_token: str = "", check_capacity: bool = True,
     ) -> tuple[list[str], list[dict[str, Any]]]:
-        """Return a GPU scope reserved against other external leases."""
+        """Check scope compatibility and promises, never just a free-VRAM scan."""
         inventory = [
             device for device in gpu_snapshot()
             if not SELECTED_GPUS or device.get("uuid") in SELECTED_GPUS
@@ -4291,33 +4376,136 @@ class Broker:
                 f"requested GPU UUIDs are not selected and available: {unknown}"
             )
         with self.cv:
-            reserved = self._reserved_gpus_locked() | self._evacuation_recovery_scopes_locked()
-            reserved |= self._handoff_scopes_locked(handoff_id)
-        conflicts = [gpu_uuid for gpu_uuid in requested if gpu_uuid in reserved]
-        if conflicts:
-            with self.cv:
-                conflicting_leases = [
-                    lease_public_summary(lease)
-                    for lease in self.leases.values()
-                    if set(lease.gpu_uuids).intersection(conflicts)
-                ]
+            reserved = (self._evacuation_recovery_scopes_locked()
+                        | self._handoff_scopes_locked(handoff_id))
+            shareable = len(requested) == 1 and not exclusive and requested_mib > 0
+            conflicting_leases = [lease_public_summary(lease)
+                for token, lease in self.leases.items()
+                if token != ignore_token and lease.state in ("pending", "active", "revoking")
+                and (not lease.gpu_uuids or set(lease.gpu_uuids).intersection(requested))
+                and (not shareable or len(lease.gpu_uuids) != 1 or lease.exclusive
+                     or lease.requested_mib <= 0 or lease.state == "revoking")]
+        conflicts = set(requested).intersection(reserved)
+        if conflicts or conflicting_leases:
             holders = "; ".join(
                 f"{lease['owner']} ({lease['justification']}; expected release "
                 f"{lease['expected_release_utc'] or 'unknown'})"
                 for lease in conflicting_leases
             )
             raise RuntimeError(
-                f"requested GPU UUIDs are already leased: {conflicts}; "
+                f"requested GPU UUIDs are already leased exclusively or reserved: {sorted(conflicts) or requested}; "
                 f"current lessee(s): {holders or 'unknown'}"
             )
-        devices = [by_uuid[gpu_uuid] for gpu_uuid in requested]
+        devices = self._lease_capacity_devices([by_uuid[gpu_uuid] for gpu_uuid in requested],
+                                               ignore_token=ignore_token)
         aggregate_free = sum(int(device.get("free_mib") or 0) for device in devices)
-        if requested_mib > 0 and requested_mib > aggregate_free:
+        if check_capacity and requested_mib > 0 and requested_mib > aggregate_free:
             raise RuntimeError(
                 f"requested {requested_mib} MiB but scoped GPUs have only "
-                f"{aggregate_free} MiB free after Ollama unload"
+                f"{aggregate_free} MiB available after existing lease/lane reservations"
             )
         return requested, devices
+
+    def _external_promises_locked(self, ignore_token: str = "") -> dict[str, int]:
+        promises: dict[str, int] = {}
+        for token, lease in self.leases.items():
+            if token == ignore_token or lease.state not in ("pending", "active", "revoking"):
+                continue
+            # Multi-GPU reservations cannot share, so no per-shard assumption
+            # grants admission there. Single-device budgets are exact totals.
+            if len(lease.gpu_uuids) == 1:
+                gpu = lease.gpu_uuids[0]
+                promises[gpu] = promises.get(gpu, 0) + lease.requested_mib
+        return promises
+
+    def _external_unrealized_locked(self, usage: dict[str, int],
+                                    ignore_token: str = "") -> dict[str, int]:
+        gaps: dict[str, int] = {}
+        for token, lease in self.leases.items():
+            if (token == ignore_token or len(lease.gpu_uuids) != 1
+                    or lease.state not in ("pending", "active", "revoking")):
+                continue
+            gpu = lease.gpu_uuids[0]
+            resident = (sum(usage.get(key, 0) for key in lease.cuda_processes or [])
+                        if lease.state == "active" else 0)
+            gaps[gpu] = gaps.get(gpu, 0) + max(0, lease.requested_mib-resident)
+        return gaps
+
+    def _lease_capacity_devices(self, devices: list[dict[str, Any]], *,
+                                ignore_token: str = "", reclaim_lanes: bool = False,
+                                reservation_owner: str = "") -> list[dict[str, Any]]:
+        usage = foreign_gpu_usage(strict=True)
+        managed_resident: dict[str, int] = {}
+        if BACKEND_TYPE == "cuda":
+            for key, used in exclusive_cuda_contexts().items():
+                if key not in usage:
+                    gpu = key.rsplit("@", 1)[-1]
+                    managed_resident[gpu] = managed_resident.get(gpu, 0)+used
+        with self.cv:
+            promised = self._external_promises_locked(ignore_token)
+            gaps = self._external_unrealized_locked(usage, ignore_token)
+            ceilings: dict[str, int] = {}
+            owned: dict[str, int] = {}
+            for token, lease in self.leases.items():
+                if token == ignore_token or len(lease.gpu_uuids) != 1:
+                    continue
+                gpu = lease.gpu_uuids[0]
+                if lease.capacity_mib > 0:
+                    ceilings[gpu] = min(ceilings.get(gpu, lease.capacity_mib), lease.capacity_mib)
+                owned[gpu] = owned.get(gpu, 0)+sum(usage.get(key, 0) for key in lease.cuda_processes or [])
+            lanes: dict[str, int] = {}
+            for lane in self.lanes.values():
+                if lane.kind != "managed":
+                    continue
+                for gpu in lane.protected_scope:
+                    lanes[gpu] = lanes.get(gpu, 0) + int(
+                        lane.reserved_mib_by_gpu.get(gpu, lane.reserved_mib))
+            for operation in self.evacuations.values():
+                if operation["id"] == reservation_owner:
+                    continue
+                if operation.get("destination_attempt", {}).get("lane_id") in self.lanes:
+                    continue
+                for gpu, amount in operation.get("destination_reservation", {}).items():
+                    lanes[gpu] = lanes.get(gpu, 0) + amount
+        result = []
+        for device in devices:
+            gpu = device["uuid"]
+            physical = max(0, int(device.get("physical_free_mib", device.get("free_mib")) or 0))
+            # Physical free already excludes resident allocations, driver and
+            # display overhead. Subtract only promises not yet resident.
+            lane_gap = max(0, lanes.get(gpu, 0)-managed_resident.get(gpu, 0))
+            available = max(0, physical - gaps.get(gpu, 0) - lane_gap)
+            if reclaim_lanes:
+                available = max(0, physical+managed_resident.get(gpu, 0)-gaps.get(gpu, 0))
+            # Keep verified usable capacity fixed while leases hold it:
+            # a concurrent free must not widen outstanding promises.
+            ceiling = ceilings.get(gpu, min(int(device["total_mib"]),
+                physical+owned.get(gpu, 0)+managed_resident.get(gpu, 0)))
+            available = min(available, max(0, ceiling-promised.get(gpu, 0)
+                                          -(0 if reclaim_lanes else lanes.get(gpu, 0))))
+            result.append({**device, "physical_free_mib": physical,
+                "external_reserved_mib": promised.get(gpu, 0),
+                "lease_capacity_mib": ceiling,
+                "free_mib": available if reclaim_lanes else min(physical, available)})
+        return result
+
+    def _wait_scope_idle(self, scope: set[str]) -> None:
+        deadline = time.monotonic()+DRAIN_TIMEOUT
+        with self.cv:
+            lanes = [lane for lane in self.lanes.values() if lane.kind == "managed"
+                     and scope.intersection(lane.protected_scope)]
+            previous = {lane.lane_id: lane.retiring for lane in lanes}
+            for lane in lanes:
+                lane.retiring = True
+            self.cv.notify_all()
+            while any(lane.in_flight for lane in lanes):
+                remaining = deadline-time.monotonic()
+                if remaining <= 0:
+                    for lane in lanes:
+                        lane.retiring = previous[lane.lane_id]
+                    self.cv.notify_all()
+                    raise TimeoutError("requests on the requested GPU scope did not drain")
+                self.cv.wait(min(remaining, 0.5))
 
     def _remove_completed_response_locked(
         self, logical_request_id: str, *, expired: bool = False,
@@ -5053,7 +5241,8 @@ class Broker:
             and device.get("uuid") not in peer_reserved
         ]
         foreign_by_gpu: dict[str, int] = {}
-        for key, used_mib in foreign_gpu_usage().items():
+        foreign_usage = foreign_gpu_usage(strict=True)
+        for key, used_mib in foreign_usage.items():
             _pid, separator, gpu_uuid = key.rpartition("@")
             if separator:
                 foreign_by_gpu[gpu_uuid] = (
@@ -5061,6 +5250,7 @@ class Broker:
                 )
         with self.cv:
             self._prune_dead_lanes_locked()
+            external_gaps = self._external_unrealized_locked(foreign_usage)
             reserved_by_gpu: dict[str, int] = {}
             for lane in self.lanes.values():
                 if (lane.kind != "managed" or not lane.scope
@@ -5087,8 +5277,12 @@ class Broker:
                 physical_free = max(0, int(device.get("total_mib") or 0))
             promised_free = max(
                 0,
-                int(device.get("total_mib") or 0)
+                min(int(device.get("total_mib") or 0),
+                    max(0, int(device.get("free_mib") or 0))
+                    + int(device.get("used_mib", int(device.get("total_mib") or 0)
+                              - int(device.get("free_mib") or 0))))
                 - foreign_by_gpu.get(gpu_uuid, 0)
+                - external_gaps.get(gpu_uuid, 0)
                 - reserved_by_gpu.get(gpu_uuid, 0),
             )
             available.append({
@@ -5097,6 +5291,11 @@ class Broker:
                 "reserved_mib": reserved_by_gpu.get(gpu_uuid, 0),
                 "free_mib": min(physical_free, promised_free),
             })
+        if not reclaiming:
+            lease_capacity = {d["uuid"]: d["free_mib"] for d in self._lease_capacity_devices(
+                devices, reservation_owner=reservation_owner)}
+            for device in available:
+                device["free_mib"] = min(device["free_mib"], lease_capacity[device["uuid"]])
         return available
 
     def _require_reclamation_feasible(
@@ -7733,28 +7932,35 @@ class Broker:
 
     def _flexible_gpu_locked(self, candidates: list[str], requested_mib: int,
                              unavailable: set[str] | None = None) -> str:
-        blocked = (self._reserved_gpus_locked() | self._handoff_scopes_locked()
+        blocked = (self._handoff_scopes_locked()
                    | self._evacuation_recovery_scopes_locked()
                    | self._peer_reserved_gpus_locked()
                    | self._unregistered_gpus_locked(refresh=True)
                    | (unavailable or set()))
-        devices = {d["uuid"]: d for d in gpu_snapshot()}
         for gpu in candidates:
-            device = devices.get(gpu)
-            if (gpu in SELECTED_GPUS and gpu not in blocked and device is not None
-                    and int(device.get("free_mib") or 0) >= requested_mib):
-                return gpu
+            if gpu in SELECTED_GPUS and gpu not in blocked:
+                try:
+                    self._plan_lease_gpus(requested_mib, [gpu])
+                    return gpu
+                except RuntimeError:
+                    continue
         raise RuntimeError("no eligible destination has verified free capacity; existing owners remain in place")
 
     def _wait_for_cooperative_handoff(
         self, scope: list[str], owner: str, justification: str,
         expected_duration_seconds: int, requested_mib: int, request_alive: Any = None,
-        priority: int = 0,
+        priority: int = 0, exclusive: bool = False,
     ) -> str:
         with self.cv:
             scope_set = set(scope)
             if not scope or any(gpu not in SELECTED_GPUS for gpu in scope):
                 return ""  # Ordinary admission owns invalid/unscoped rejection.
+            if len(scope) == 1 and requested_mib > 0 and not exclusive:
+                try:
+                    self._plan_lease_gpus(requested_mib, scope)
+                    return ""  # Fitting leases share; no relocation is needed.
+                except RuntimeError:
+                    pass
             if scope_set.intersection(self._handoff_scopes_locked()):
                 raise RuntimeError("another cooperative handoff already targets this GPU scope")
             live = list(self.leases.values())
@@ -7839,12 +8045,14 @@ class Broker:
                 source = list(lease.gpu_uuids)
                 target = move["to_gpu_uuid"]
             # The owner must stop its CUDA workers first. This never kills them.
-            wait_for_foreign_settle(lease.foreign_baseline, set(source))
+            ignored = {key for other in self.leases.values() if other.token != token
+                       for key in other.cuda_processes or []}
+            wait_for_foreign_settle(lease.foreign_baseline, set(source), ignored_processes=ignored)
             def verify_source_exit() -> None:
                 # Aggregate release tolerance is useful for ordinary accounting
                 # drift, but cannot authorize a live small CUDA context to move.
                 current = foreign_gpu_usage(strict=True)
-                if any(key.rsplit("@", 1)[-1] in source
+                if any(key not in ignored and key.rsplit("@", 1)[-1] in source
                        and (key not in lease.foreign_baseline
                             or used > lease.foreign_baseline[key])
                        for key, used in current.items()):
@@ -7866,16 +8074,20 @@ class Broker:
                             or self._revoke_if_pending_deadline_expired_locked(lease)):
                         raise RuntimeError("relocation ownership or handoff changed while draining")
                     previous = (lease.gpu_uuids, lease.state, lease.foreign_baseline,
-                                lease.transition_started_at, lease.heartbeat_at)
+                                lease.transition_started_at, lease.heartbeat_at, lease.cuda_processes,
+                                lease.capacity_mib)
                     lease.gpu_uuids = [target]
                     lease.state = "pending"
                     lease.foreign_baseline = baseline
+                    lease.cuda_processes = None
+                    lease.capacity_mib = int(devices[0].get("lease_capacity_mib") or 0)
                     lease.transition_started_at = lease.heartbeat_at = time.time()
                     try:
                         self._persist_leases_locked()
                     except Exception:
                         (lease.gpu_uuids, lease.state, lease.foreign_baseline,
-                         lease.transition_started_at, lease.heartbeat_at) = previous
+                         lease.transition_started_at, lease.heartbeat_at, lease.cuda_processes,
+                         lease.capacity_mib) = previous
                         raise
                     self.cv.notify_all()
                 return {"ok": True, "lease": asdict(lease), "previous_gpu_uuids": source,
@@ -7891,7 +8103,7 @@ class Broker:
         *, priority: int | None = None, evacuation_id: str = "",
         _evacuation_commit_id: str = "",
         yield_on_request: bool = False, request_alive: Any = None,
-        placement: str = "fixed",
+        placement: str = "fixed", exclusive: bool = False,
     ) -> dict[str, Any]:
         owner = owner.strip()
         justification = justification.strip()
@@ -7905,6 +8117,8 @@ class Broker:
             raise ValueError(
                 "expected_duration_seconds must be non-negative (zero means unknown)"
             )
+        if type(exclusive) is not bool:
+            raise ValueError("exclusive must be a Boolean")
         if type(yield_on_request) is not bool:
             raise ValueError("yield_on_request must be a Boolean")
         if placement not in ("fixed", "flexible"):
@@ -7914,6 +8128,8 @@ class Broker:
             raise ValueError("priority must be an integer between -1000 and 1000")
         requested_scope = list(dict.fromkeys(requested_gpu_uuids or OWNER_GPU_SCOPES.get(owner, [])))
         eligible = []
+        if exclusive and (not requested_scope or placement != "fixed" or yield_on_request or evacuation_id):
+            raise ValueError("exclusive requires an explicit fixed GPU scope without yield or evacuation")
         if placement == "flexible":
             if evacuation_id or yield_on_request:
                 raise ValueError("flexible placement cannot combine cache evacuation or legacy yield")
@@ -7934,7 +8150,7 @@ class Broker:
         require_gpu_health(refresh=True)
         handoff_id = self._wait_for_cooperative_handoff(
             requested_scope, owner, justification, expected_duration_seconds, requested_mib, request_alive,
-            lease_priority,
+            lease_priority, exclusive,
         )
         try:
             if handoff_id:
@@ -7944,7 +8160,7 @@ class Broker:
             return self._acquire_once(owner, requested_mib, ttl, requested_scope,
                                       justification, expected_duration_seconds,
                                       _evacuation_commit_id, yield_on_request, handoff_id, request_alive,
-                                      placement, lease_priority, eligible)
+                                      placement, lease_priority, eligible, exclusive)
         finally:
             if handoff_id:
                 with self.cv:
@@ -7956,6 +8172,7 @@ class Broker:
         justification: str, expected_duration_seconds: int,
         _evacuation_commit_id: str, yield_on_request: bool, handoff_id: str, request_alive: Any,
         placement: str = "fixed", priority: int = 0, eligible_gpu_uuids: list[str] | None = None,
+        exclusive: bool = False,
     ) -> dict[str, Any]:
         with self.transition:
             with self.cv:
@@ -7967,22 +8184,13 @@ class Broker:
                     if request is None or request["expires_at"] <= time.time():
                         raise TimeoutError("cooperative handoff expired before admission")
                     request["state"] = "admitting"
-                if self.pending_lease():
-                    pending = next(
-                        lease for lease in self.leases.values()
-                        if lease.state in ("pending", "revoking")
-                    )
-                    visible = lease_public_summary(pending)
-                    raise RuntimeError(
-                        "another lease transition is in progress: "
-                        f"{visible['owner']} ({visible['justification']}; expected release "
-                        f"{visible['expected_release_utc'] or 'unknown'})"
-                    )
                 live = [lease for lease in self.leases.values()
                         if lease.state in ("pending", "active", "revoking")]
                 if any(not lease.gpu_uuids for lease in live) or (not requested_scope and live):
                     raise RuntimeError("unscoped leases require exclusive host-wide ownership")
-            self.begin_drain(f"lease acquire by {owner}")
+            drain_host = not requested_scope or bool(running_models(require_available=True))
+            if drain_host:
+                self.begin_drain(f"lease acquire by {owner}")
             try:
                 stopped: list[str] = []
                 # The system lane is not GPU-scoped, so unload any model it
@@ -7992,7 +8200,8 @@ class Broker:
                 unloaded = self._unload_base_models()
                 if requested_scope:
                     gpu_uuids, devices = self._plan_lease_gpus(
-                        0, requested_scope, handoff_id,
+                        requested_mib, requested_scope, handoff_id,
+                        exclusive=exclusive, check_capacity=False,
                     )
                     aggregate_free = sum(
                         int(device["free_mib"]) for device in devices
@@ -8000,14 +8209,19 @@ class Broker:
                     with self.cv:
                         overlaps_group = bool(set(gpu_uuids).intersection(
                             self._peer_reserved_gpus_locked()))
-                    if lease_requires_exclusive_gpus(gpu_uuids) or overlaps_group:
+                    if lease_requires_exclusive_gpus(gpu_uuids, exclusive) or overlaps_group:
                         # Retire lanes before the owner starts peer traffic;
                         # the scope stays blocked for the lease's lifetime.
+                        self._wait_scope_idle(set(gpu_uuids))
                         stopped = self.stop_pool_lanes(
-                            "exclusive multi-GPU lease acquire",
+                            "exclusive GPU lease acquire",
                             set(gpu_uuids),
                         )
                     elif requested_mib > 0 and requested_mib > aggregate_free:
+                        upper_bound = self._lease_capacity_devices(devices, reclaim_lanes=True)
+                        if requested_mib > sum(int(d["free_mib"]) for d in upper_bound):
+                            raise RuntimeError("insufficient VRAM after existing external lease reservations")
+                        self._wait_scope_idle(set(gpu_uuids))
                         stopped = self.stop_pool_lanes(
                             "lease acquire capacity reclamation",
                             set(gpu_uuids),
@@ -8016,7 +8230,7 @@ class Broker:
                     # retirement and enforce the reservation against the
                     # resulting live capacity.
                     gpu_uuids, devices = self._plan_lease_gpus(
-                        requested_mib, requested_scope, handoff_id,
+                        requested_mib, requested_scope, handoff_id, exclusive=exclusive,
                     )
                 else:
                     stopped = self.stop_pool_lanes("lease acquire")
@@ -8032,6 +8246,8 @@ class Broker:
                 if handoff_id and request_alive is not None and not request_alive():
                     raise RuntimeError("cooperative requester disconnected before lease grant")
                 now = time.time()
+                if exclusive:
+                    require_exclusive_cuda_free(gpu_uuids)
                 token = "lease_" + secrets.token_urlsafe(24)
                 lease = Lease(
                     token, owner, "pending", requested_mib, now, now, now, ttl,
@@ -8039,7 +8255,9 @@ class Broker:
                     now + expected_duration_seconds if expected_duration_seconds else 0.0,
                     _evacuation_commit_id,
                     yield_on_request,
-                    placement, priority, list(eligible_gpu_uuids or []),
+                    placement, priority, list(eligible_gpu_uuids or []), exclusive,
+                    capacity_mib=(int(devices[0].get("lease_capacity_mib") or 0)
+                                  if len(gpu_uuids) == 1 else 0),
                 )
                 with self.cv:
                     if _evacuation_commit_id:
@@ -8053,7 +8271,7 @@ class Broker:
                     if _evacuation_commit_id:
                         self._commit_cache_evacuation_locked(_evacuation_commit_id, lease)
                 LOG.info("lease acquired owner=%s requested_mib=%s unloaded=%s", owner, requested_mib, unloaded)
-                if gpu_uuids:
+                if gpu_uuids and drain_host:
                     self.end_drain()
                 return {"ok": True, "lease": asdict(lease), "unloaded": unloaded,
                         "stopped_lanes": stopped,
@@ -8061,12 +8279,17 @@ class Broker:
                         "coordination_warning": LEASE_COORDINATION_WARNING,
                         "public_lease": lease_public_summary(lease)}
             except Exception:
-                self.end_drain()
+                if drain_host:
+                    self.end_drain()
                 raise
 
-    def ready(self, token: str) -> dict[str, Any]:
+    def ready(self, token: str, workload_pid: int | None = None) -> dict[str, Any]:
         require_gpu_health(refresh=True)
+        if workload_pid is not None and (type(workload_pid) is not int or workload_pid <= 0
+                                         or not Path(f"/proc/{workload_pid}").exists()):
+            raise ValueError("workload_pid must identify the live workload parent")
         with self.transition:
+            usage = foreign_gpu_usage(strict=BACKEND_TYPE == "cuda")
             with self.cv:
                 lease = self.leases.get(token)
                 if lease is None:
@@ -8075,11 +8298,28 @@ class Broker:
                     raise RuntimeError(
                         "lease transition was revoked; free CUDA memory and release the lease"
                     )
-                if lease.state != "pending":
+                if lease.state != "pending" and not (lease.state == "active" and workload_pid is not None):
                     raise RuntimeError("lease is not pending")
+                peers = [other for other in self.leases.values() if other.token != token
+                         and set(other.gpu_uuids).intersection(lease.gpu_uuids)]
+                claimed = {key for other in peers for key in other.cuda_processes or []}
+                candidates = [key for key, used in usage.items()
+                    if key.rsplit("@", 1)[-1] in lease.gpu_uuids and key not in claimed
+                    and (workload_pid is not None and workload_contains_pid(workload_pid, int(key.split('@')[0]))
+                         or workload_pid is None and (key not in (lease.foreign_baseline or {})
+                             or used > (lease.foreign_baseline or {}).get(key, 0)))]
+                ambiguous = workload_pid is None and candidates and any(
+                    other.state == "pending" or other.cuda_processes is None for other in peers)
+                previous = lease.state, lease.heartbeat_at, lease.cuda_processes
+                lease.cuda_processes = None if ambiguous else candidates
                 lease.state = "active"
                 lease.heartbeat_at = time.time()
-                self._persist_leases_locked()
+                try:
+                    self._persist_leases_locked()
+                except Exception:
+                    lease.state, lease.heartbeat_at, lease.cuda_processes = previous
+                    raise
+                self.cv.notify_all()
             devices = gpu_snapshot()
             if lease.gpu_uuids:
                 self.end_drain()
@@ -8088,7 +8328,7 @@ class Broker:
                     "host_memory": host_memory_snapshot()}
 
     def scope(self, token: str, requested_gpu_uuids: list[str]) -> dict[str, Any]:
-        """Convert a live legacy lease to an external-owner-exclusive scope.
+        """Convert a live lease to a compatible, budgeted GPU scope.
 
         This transition does not stop the external workload. It is safe only
         when every foreign allocation that grew after acquire is contained in
@@ -8119,24 +8359,16 @@ class Broker:
                     raise KeyError("unknown lease")
                 if lease.state not in ("pending", "active"):
                     raise RuntimeError("only a pending or active lease can change scope")
-                if (lease.yield_on_request or lease.placement == "flexible") and requested != lease.gpu_uuids:
+                if (lease.exclusive or lease.yield_on_request or lease.placement == "flexible") and requested != lease.gpu_uuids:
                     raise RuntimeError("cooperative owners must release before changing GPU scope")
                 if set(requested).intersection(self._handoff_scopes_locked()):
                     raise RuntimeError("scope reserved for cooperative handoff")
-                conflicts = {
-                    gpu_uuid
-                    for other_token, other in self.leases.items()
-                    if other_token != token
-                    for gpu_uuid in other.gpu_uuids
-                    if other.state in ("pending", "active", "revoking")
-                } & set(requested)
-                if conflicts:
-                    raise RuntimeError(
-                        f"requested GPU UUIDs are already leased: {sorted(conflicts)}"
-                    )
+                _, planned_devices = self._plan_lease_gpus(lease.requested_mib, requested,
+                    exclusive=lease.exclusive, ignore_token=token,
+                    check_capacity=set(requested) != set(lease.gpu_uuids))
                 if any(lane.kind == "managed"
                        and set(requested).intersection(lane.protected_scope)
-                       and (len(lane.scope) > 1 or lease_requires_exclusive_gpus(requested))
+                       and (len(lane.scope) > 1 or lease_requires_exclusive_gpus(requested, lease.exclusive))
                        for lane in self.lanes.values()):
                     raise RuntimeError(
                         "live scope change would overlap managed peer traffic; "
@@ -8164,9 +8396,17 @@ class Broker:
                         f"provide only {aggregate_total} MiB"
                     )
                 previous_scope = list(lease.gpu_uuids)
+                previous = lease.gpu_uuids, lease.heartbeat_at, lease.capacity_mib
                 lease.gpu_uuids = requested
+                if set(requested) != set(previous_scope):
+                    lease.capacity_mib = (int(planned_devices[0].get("lease_capacity_mib") or 0)
+                                          if len(requested) == 1 else 0)
                 lease.heartbeat_at = time.time()
-                self._persist_leases_locked()
+                try:
+                    self._persist_leases_locked()
+                except Exception:
+                    lease.gpu_uuids, lease.heartbeat_at, lease.capacity_mib = previous
+                    raise
                 state = lease.state
                 result = asdict(lease)
             with self.cv:
@@ -8174,7 +8414,7 @@ class Broker:
                     self.draining = False
                     self.cv.notify_all()
             stopped = []
-            if lease_requires_exclusive_gpus(requested):
+            if lease_requires_exclusive_gpus(requested, lease.exclusive):
                 # The scope is now blocked, so no new lane lands here. Retire
                 # lanes already resident rather than leave them to idle out
                 # at an unpredictable moment during peer traffic.
@@ -8199,10 +8439,15 @@ class Broker:
             }
 
     def prepare(self, token: str, *, priority: int | None = None,
-                evacuation_id: str = "", _evacuation_commit_id: str = "") -> dict[str, Any]:
+                evacuation_id: str = "", _evacuation_commit_id: str = "",
+                requested_mib: int | None = None) -> dict[str, Any]:
         if priority is not None and not evacuation_id:
             raise ValueError("priority requires an explicit evacuation ID")
+        if requested_mib is not None and (type(requested_mib) is not int or requested_mib <= 0):
+            raise ValueError("requested_mib must be a positive total VRAM budget")
         if evacuation_id:
+            if requested_mib is not None:
+                raise ValueError("resize the budget separately from cache evacuation")
             return self._lease_evacuation("prepare", {"token": token}, priority, evacuation_id)
         require_gpu_health(refresh=True)
         with self.transition:
@@ -8210,39 +8455,63 @@ class Broker:
                 lease = self.leases.get(token)
                 if lease is None:
                     raise KeyError("unknown lease")
-                if self.pending_lease():
-                    raise RuntimeError("a lease transition is already pending")
                 if lease.state != "active":
                     raise RuntimeError("only an active lease can prepare a resize")
-            self.begin_drain(f"lease resize by {lease.owner}")
+                target = lease.requested_mib if requested_mib is None else requested_mib
+                if target < lease.requested_mib:
+                    raise ValueError("prepare grows the total budget; release before reducing it")
+                scope = list(lease.gpu_uuids)
+                if not scope and self.pending_lease():
+                    raise RuntimeError("a lease transition is already pending")
+            drain_host = not scope or bool(running_models(require_available=True))
+            if drain_host:
+                self.begin_drain(f"lease resize by {lease.owner}")
             try:
-                stopped = self.stop_pool_lanes(
-                    "lease prepare", set(lease.gpu_uuids) if lease.gpu_uuids else None,
-                )
+                stopped = []
+                if scope:
+                    _, compatible = self._plan_lease_gpus(target, scope, exclusive=lease.exclusive,
+                        ignore_token=token, check_capacity=False)
+                    current = self._lease_capacity_devices(compatible)
+                    additional = target-lease.requested_mib
+                    reclaim = (lease_requires_exclusive_gpus(scope, lease.exclusive)
+                               or target == 0 or additional > sum(d["free_mib"] for d in current))
+                    if reclaim:
+                        upper = self._lease_capacity_devices(compatible, reclaim_lanes=True)
+                        if additional > sum(d["free_mib"] for d in upper):
+                            raise RuntimeError("insufficient VRAM after other lease reservations")
+                        self._wait_scope_idle(set(scope))
+                        stopped = self.stop_pool_lanes("lease prepare", set(scope))
+                    if additional > sum(d["free_mib"] for d in self._lease_capacity_devices(gpu_snapshot())
+                                        if d["uuid"] in scope):
+                        raise RuntimeError("requested growth does not fit live VRAM and reservations")
+                else:
+                    stopped = self.stop_pool_lanes("lease prepare")
                 unloaded = self._unload_base_models()
                 with self.cv:
                     if _evacuation_commit_id:
                         self._assert_evacuation_current(self.evacuations[_evacuation_commit_id])
                     now = time.time()
-                    previous = (lease.state, lease.heartbeat_at, lease.transition_started_at, lease.evacuation_id)
-                    lease.state = "pending"
-                    lease.heartbeat_at = now
-                    lease.transition_started_at = now
+                    previous = (lease.state, lease.heartbeat_at, lease.transition_started_at,
+                                lease.evacuation_id, lease.requested_mib)
+                    lease.state, lease.heartbeat_at, lease.transition_started_at = "pending", now, now
                     lease.evacuation_id = _evacuation_commit_id or lease.evacuation_id
+                    lease.requested_mib = target
                     try:
                         self._persist_leases_locked()
                     except Exception:
-                        lease.state, lease.heartbeat_at, lease.transition_started_at, lease.evacuation_id = previous
+                        (lease.state, lease.heartbeat_at, lease.transition_started_at,
+                         lease.evacuation_id, lease.requested_mib) = previous
                         raise
                     if _evacuation_commit_id:
                         self._commit_cache_evacuation_locked(_evacuation_commit_id, lease)
-                if lease.gpu_uuids:
+                    self.cv.notify_all()
+                if scope and drain_host:
                     self.end_drain()
                 return {"ok": True, "lease": asdict(lease), "unloaded": unloaded,
-                        "stopped_lanes": stopped,
-                        "gpus": gpu_snapshot()}
+                        "stopped_lanes": stopped, "gpus": gpu_snapshot()}
             except Exception:
-                self.end_drain()
+                if drain_host:
+                    self.end_drain()
                 raise
 
     def release(self, token: str, reason: str = "lease release",
@@ -8270,7 +8539,7 @@ class Broker:
                 # allocations, including after a broker restart.
                 stopped = []
                 unloaded = []
-                if force:
+                if force and not lease.exclusive:
                     # Operator override for a lease whose owner is gone. The
                     # settle check can never pass once the owner's allocation
                     # is unverifiable, so refusing here would leave the scope
@@ -8280,10 +8549,15 @@ class Broker:
                         "is not verified", lease.owner,
                     )
                 else:
-                    wait_for_foreign_settle(
-                        lease.foreign_baseline,
-                        scoped_gpus if scoped_release else None,
-                    )
+                    if scoped_release and lease.cuda_processes is not None:
+                        wait_for_owned_cuda_exit(lease.cuda_processes)
+                    else:
+                        ignored = {key for other in self.leases.values() if other.token != token
+                                   for key in other.cuda_processes or []}
+                        wait_for_foreign_settle(lease.foreign_baseline,
+                            scoped_gpus if scoped_release else None, ignored_processes=ignored)
+                    if lease.exclusive:
+                        require_exclusive_cuda_free(lease.gpu_uuids)
                 with self.cv:
                     self.leases.pop(token, None)
                     self._persist_leases_locked()
@@ -9774,12 +10048,14 @@ class ControlHandler(socketserver.StreamRequestHandler):
                         yield_on_request=request.get("yield_on_request", False),
                         request_alive=self.request_alive,
                         placement=request.get("placement", "fixed"),
+                        exclusive=request.get("exclusive", False),
                     )
                 elif action == "relocate":
                     result = self.broker.relocate(str(request.get("token") or ""),
                                                   str(request.get("handoff_id") or ""))
                 elif action == "ready":
-                    result = self.broker.ready(str(request.get("token") or ""))
+                    result = self.broker.ready(str(request.get("token") or ""),
+                                               workload_pid=request.get("workload_pid"))
                 elif action == "scope":
                     requested_gpu_uuids = request.get("gpu_uuids")
                     if not isinstance(requested_gpu_uuids, list):
@@ -9790,7 +10066,8 @@ class ControlHandler(socketserver.StreamRequestHandler):
                     )
                 elif action == "prepare":
                     result = self.broker.prepare(str(request.get("token") or ""),
-                        priority=request.get("priority"), evacuation_id=str(request.get("evacuation_id") or ""))
+                        priority=request.get("priority"), evacuation_id=str(request.get("evacuation_id") or ""),
+                        requested_mib=request.get("requested_mib"))
                 elif action == "set_cache_policy":
                     result = self.broker.set_cache_policy(str(request.get("model") or ""),
                         request.get("movable"), request.get("priority"), request.get("gpu_uuids"))
@@ -10112,7 +10389,7 @@ def lease_run_flexible(args: argparse.Namespace) -> int:
                 break
             if child.poll() is not None:
                 raise RuntimeError("flexible workload exited before readiness")
-            send_control({"action": "ready", "token": token})
+            send_control({"action": "ready", "token": token, "workload_pid": child.pid})
             move = None
             draining_owner = False
             while not stop.wait(0.2):
@@ -10211,7 +10488,11 @@ def lease_run_flexible(args: argparse.Namespace) -> int:
 def lease_run(args: argparse.Namespace) -> int:
     if not args.ready_command:
         raise RuntimeError("run requires --ready-command so Ollama cannot reload before external CUDA allocation")
+    if getattr(args, "exclusive", False) and args.placement != "fixed":
+        raise ValueError("exclusive run requires fixed placement")
     if args.placement == "flexible":
+        if getattr(args, "exclusive", False):
+            raise ValueError("exclusive leases require fixed placement")
         return lease_run_flexible(args)
     owner = args.owner or f"{os.environ.get('USER', 'user')}:{os.getpid()}"
     acquired = send_control({"action": "acquire", "owner": owner,
@@ -10219,7 +10500,8 @@ def lease_run(args: argparse.Namespace) -> int:
                              "gpu_uuids": args.gpu,
                              "justification": args.justification,
                              "expected_duration_seconds": args.expected_duration,
-                             "priority": args.priority, "evacuation_id": args.evacuation_id})
+                             "priority": args.priority, "evacuation_id": args.evacuation_id,
+                             "exclusive": getattr(args, "exclusive", False)})
     print_lease_recommendations(acquired)
     token = acquired["lease"]["token"]
     env = os.environ.copy()
@@ -10270,7 +10552,7 @@ def lease_run(args: argparse.Namespace) -> int:
             raise RuntimeError("external command exited before its readiness check passed")
         if time.monotonic() >= deadline:
             raise TimeoutError("external workload did not become ready before timeout")
-        send_control({"action": "ready", "token": token})
+        send_control({"action": "ready", "token": token, "workload_pid": child.pid})
         try:
             return_code = child.wait()
             if heartbeat_failed.is_set():
@@ -10337,6 +10619,7 @@ def main() -> int:
     acquire.add_argument("--vram-mib", type=int, default=0)
     acquire.add_argument("--ttl", type=int, default=DEFAULT_LEASE_TTL)
     acquire.add_argument("--gpu", action="append", default=[])
+    acquire.add_argument("--exclusive", action="store_true", help="reserve explicit fixed GPUs without managed-lane co-tenancy")
     acquire.add_argument("--token-only", action="store_true")
     acquire.add_argument("--yield-on-request", action="store_true",
                          help="opt in to cooperative single-GPU handoff; owner must honor discovery intent")
@@ -10364,6 +10647,11 @@ def main() -> int:
         if name == "prepare":
             command.add_argument("--priority", type=int)
             command.add_argument("--evacuation-id", default="")
+            command.add_argument("--vram-mib", type=int, default=None,
+                                 help="new total VRAM budget, reserved before growth")
+        if name == "ready":
+            command.add_argument("--pid", dest="workload_pid", type=int, default=None,
+                                 help="workload parent PID for concurrent-owner CUDA accounting")
         if name == "release":
             command.add_argument(
                 "--force", action="store_true",
@@ -10385,6 +10673,7 @@ def main() -> int:
     run.add_argument("--vram-mib", type=int, default=0)
     run.add_argument("--ttl", type=int, default=DEFAULT_LEASE_TTL)
     run.add_argument("--gpu", action="append", default=[])
+    run.add_argument("--exclusive", action="store_true", help="reserve explicit fixed GPUs without managed-lane co-tenancy")
     run.add_argument("--priority", type=int)
     run.add_argument("--placement", choices=("fixed", "flexible"), default="fixed")
     run.add_argument("--drain-command", default="",
@@ -10448,6 +10737,7 @@ def main() -> int:
                                "gpu_uuids": args.gpu,
                                "justification": args.justification,
                                "expected_duration_seconds": args.expected_duration,
+                               "exclusive": getattr(args, "exclusive", False),
                                "yield_on_request": args.yield_on_request,
                                "placement": args.placement,
                                "priority": args.priority, "evacuation_id": args.evacuation_id})
@@ -10479,6 +10769,10 @@ def main() -> int:
             control["force"] = True
         if args.command_name == "prepare":
             control.update(priority=args.priority, evacuation_id=args.evacuation_id)
+            if args.vram_mib is not None:
+                control["requested_mib"] = args.vram_mib
+        if args.command_name == "ready" and args.workload_pid is not None:
+            control["workload_pid"] = args.workload_pid
         result = send_control(control)
     elif args.command_name == "run":
         if not args.command:
@@ -10503,6 +10797,7 @@ if __name__ == "__main__":
     except (OSError, RuntimeError, TimeoutError) as exc:
         print(f"ollama-unify negotiator: {exc}", file=sys.stderr)
         raise SystemExit(1)
+
 NEGOTIATOR
 }
 
@@ -11734,7 +12029,7 @@ This host runs the ollama-unify GPU lease broker. Before creating, starting, or 
 2. Launch long-running CUDA services with `docker gpu run --owner NAME --justification PURPOSE --expected-duration SECONDS --vram-mib MIB --gpu GPU_UUID --ready-command 'CHECK' -- COMMAND`. Repeat `--gpu` for each reserved device. The readiness check must pass only after CUDA models are resident.
 3. For an independently supervised service, use scoped `acquire --owner NAME --justification PURPOSE --expected-duration SECONDS --gpu GPU_UUID`, set the child's `CUDA_VISIBLE_DEVICES` to exactly the same UUIDs, load the CUDA models, call `ready`, call `prepare` before any VRAM growth, and call `release` only after freeing CUDA memory.
 4. Lease registration requires a specific owner. Provide --justification PURPOSE and --expected-duration SECONDS when setting up workloads to help other agents coordinate; these are recommendations, and missing metadata must not halt a basic deployment. Omitted purpose and release time remain unknown and do not affect heartbeat TTL. These fields and the GPU scope are visible to other local agents; tokens are not exposed in discovery. Review current lessees before acquiring.
-5. Pending and revoking scoped leases block their GPUs. After `ready`, the broker can place Ollama lanes in measured free VRAM on single-GPU scopes. Multi-GPU scopes stay exclusive until release: the broker retires Ollama lanes there at acquire and never places, loads, or reclaims lanes on them, because lane churn during peer-to-peer (NVLink/NCCL) traffic is unsafe. The active workload must call `prepare` before any VRAM growth. Unscoped leases retain a host-wide drain because placement cannot be proven. A revoked lease whose owner stops heartbeating is abandoned once the revoke deadline passes, and its scope returns to live placement, so always `release` rather than letting an owner exit.
+5. Positive --vram-mib single-GPU leases share memory when their combined promises and live usage fit; there is no lease-count cap. Zero-budget, explicit --exclusive and multi-GPU owners retain exclusive external scopes. Call prepare TOKEN --vram-mib NEW_TOTAL before exceeding the budget, and ready TOKEN --pid WORKLOAD_PID after allocation. The run wrapper registers its child automatically. Pending and revoking scoped leases defer Ollama placement. After `ready`, the broker can place Ollama lanes in measured free VRAM on single-GPU scopes. Multi-GPU scopes stay exclusive until release: the broker retires Ollama lanes there at acquire and never places, loads, or reclaims lanes on them, because lane churn during peer-to-peer (NVLink/NCCL) traffic is unsafe. The active workload must call `prepare` before any VRAM growth. Unscoped leases retain a host-wide drain because placement cannot be proven. A revoked lease whose owner stops heartbeating is abandoned once the revoke deadline passes, and its scope returns to live placement, so always `release` rather than letting an owner exit.
 6. Never bypass the broker by assuming free VRAM from a static scan. Unregistered CUDA activity quarantines affected GPUs: broker model load/unload is deferred until it exits. This cannot prevent its initial allocation or replace cooperative leases.
 7. Ollama API `num_gpu` counts offloaded layers, not physical GPUs. Keep it automatic (`-1`).
 8. Clients that require exact Ollama placement must send an ordered hard allowlist as `gpu_uuids` on capacity requests and `X-Ollama-Unify-GPU-UUIDs` on inference requests. The broker uses the ordered intersection with its live selected GPUs, rejects an empty intersection, and never falls back outside the allowlist.
@@ -11750,7 +12045,7 @@ render_global_codex_gpu_block() {
 <!-- BEGIN ollama-unify GPU negotiator -->
 ## CUDA deployment policy
 
-Before changing or starting any Docker/container/service workload that uses CUDA on this host, run `docker gpu discover` and inspect its warnings and active lease summaries. New leases require `--owner`; suggest `--justification` and `--expected-duration` when setting up workloads, but missing purpose or duration must not halt basic deployments. Owner, purpose, GPU scope, and expected release are visible to other local agents; omitted metadata remains unknown and does not change heartbeat TTL. Use scoped `docker gpu run --gpu GPU_UUID` for foreground deployments or the scoped acquire → ready → prepare/resize → release protocol for independently supervised services. The external workload must use exactly its reserved GPU UUIDs. Fixed placement preserves an exact GPU group. Restartable single-GPU services can opt in to `--placement flexible` with ordered candidates, a priority, and drain/readiness hooks; a higher-priority fixed request waits for a reserved destination, graceful stop, verified CUDA release and readiness before admission. Fixed owners are never silently moved. Pending and revoking scopes block those GPUs. Active scopes may share measured free VRAM with broker-owned Ollama lanes, and must call `prepare` before growth. Do not rely on static free-VRAM scans or bypass the broker; anonymous CUDA allocation is only best-effort. Full instructions are at `/usr/local/share/ollama-unify/AGENTS.md`.
+Before changing or starting any Docker/container/service workload that uses CUDA on this host, run `docker gpu discover` and inspect its warnings and active lease summaries. New leases require `--owner`; suggest `--justification` and `--expected-duration` when setting up workloads, but missing purpose or duration must not halt basic deployments. Owner, purpose, GPU scope, and expected release are visible to other local agents; omitted metadata remains unknown and does not change heartbeat TTL. Use scoped `docker gpu run --gpu GPU_UUID` for foreground deployments or the scoped acquire → ready → prepare/resize → release protocol for independently supervised services. The external workload must use exactly its reserved GPU UUIDs. Fixed placement preserves an exact GPU group. Restartable single-GPU services can opt in to `--placement flexible` with ordered candidates, a priority, and drain/readiness hooks; a higher-priority fixed request waits for a reserved destination, graceful stop, verified CUDA release and readiness before admission. Fixed owners are never silently moved. Pending and revoking scopes block those GPUs. Positive single-GPU VRAM budgets may share with other leases and Ollama lanes when all promises fit. Use prepare --vram-mib NEW_TOTAL before exceeding the budget, and ready --pid WORKLOAD_PID for independently supervised concurrent loaders. Zero-budget, explicit-exclusive and multi-GPU scopes remain exclusive. Do not rely on static free-VRAM scans or bypass the broker; anonymous CUDA allocation is only best-effort. Full instructions are at `/usr/local/share/ollama-unify/AGENTS.md`.
 <!-- END ollama-unify GPU negotiator -->
 CODEX_BLOCK
 }

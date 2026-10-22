@@ -27,7 +27,9 @@ GPUS = ['GPU-large-0', 'GPU-large-1', 'GPU-large-2']
 
 def acquire(case, owner='requester', gpu=GPUS[0], **overrides):
     return p.control_raw(case.socket_path, {
-        'action': 'acquire', 'owner': owner, 'requested_mib': 1024, 'ttl': 60,
+        # These tests require a real capacity conflict; fitting ordinary
+        # requests now share the GPU without asking an incumbent to move.
+        'action': 'acquire', 'owner': owner, 'requested_mib': 61440, 'ttl': 60,
         'gpu_uuids': [gpu], 'justification': 'CPU fixture tests cooperative lease ownership',
         'expected_duration_seconds': 60, **overrides})
 

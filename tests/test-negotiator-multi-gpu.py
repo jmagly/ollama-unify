@@ -794,6 +794,12 @@ class ReclamationFeasibilityTests(unittest.TestCase):
             mock.patch.object(n, 'process_group_alive', return_value=True),
             mock.patch.object(n, 'gpu_snapshot', side_effect=lambda: self.devices),
             mock.patch.object(n, 'foreign_gpu_usage', side_effect=lambda **kw: self.foreign),
+            mock.patch.object(n, 'exclusive_cuda_contexts', side_effect=lambda: {
+                **self.foreign, **{f'{index+100}@{device["uuid"]}': max(0,
+                    device['total_mib']-device['free_mib']-sum(used for key, used
+                    in self.foreign.items() if key.endswith('@'+device['uuid'])))
+                    for index, device in enumerate(self.devices)},
+            }),
             mock.patch.object(n, 'host_memory_snapshot', return_value={'memavailable_mib': 1000000}),
         ]
         for patch in patches:
