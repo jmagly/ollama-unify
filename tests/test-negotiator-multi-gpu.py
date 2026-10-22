@@ -427,6 +427,12 @@ class MultiGpuIntegrationTests(unittest.TestCase):
 
 class MultiGpuLifecycleTests(unittest.TestCase):
     def setUp(self):
+        patch = mock.patch.object(n, 'running_models', return_value=[])
+        patch.start()
+        self.addCleanup(patch.stop)
+        patch = mock.patch.object(n, 'exclusive_cuda_contexts', return_value={})
+        patch.start()
+        self.addCleanup(patch.stop)
         for name, value in [('BACKEND_TYPE', 'cuda'), ('SELECTED_GPUS', PAIR)]:
             patch = mock.patch.object(n, name, value)
             patch.start()
