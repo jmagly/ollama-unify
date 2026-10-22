@@ -199,6 +199,15 @@ class SharedBudgetTests(unittest.TestCase):
         self.assertIn(other,self.broker.leases)
         self.assertEqual(self.usage,{'222@'+GPUS[0]:20})
 
+    def test_release_checks_contexts_created_after_readiness(self):
+        first=self.acquire(30);self.broker.ready(first)
+        self.assertEqual(self.broker.leases[first].cuda_processes,[])
+        self.usage['111@'+GPUS[0]]=0
+        with self.assertRaises(TimeoutError):self.broker.release(first)
+        self.assertIn(first,self.broker.leases)
+        self.usage.clear()
+        self.broker.release(first)
+
     def test_malformed_or_missing_memory_telemetry_cannot_admit_new_work(self):
         with mock.patch.object(m,'foreign_gpu_usage',side_effect=RuntimeError('unavailable')):
             with self.assertRaises(RuntimeError):self.acquire(10)

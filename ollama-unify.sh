@@ -2451,6 +2451,8 @@ def wait_for_foreign_settle(
     *, ignored_processes: set[str] | None = None,
     strict_contexts: bool = False,
 ) -> None:
+    if strict_contexts and baseline is None:
+        baseline = {}
     baseline = ({key: value for key, value in baseline.items()
                  if key not in (ignored_processes or set())}
                 if baseline is not None else None)
@@ -8568,12 +8570,13 @@ class Broker:
                 else:
                     if scoped_release and lease.cuda_processes is not None:
                         wait_for_owned_cuda_exit(lease.cuda_processes)
-                    else:
-                        ignored = {key for other in self.leases.values() if other.token != token
-                                   for key in other.cuda_processes or []}
-                        wait_for_foreign_settle(lease.foreign_baseline,
-                            scoped_gpus if scoped_release else None, ignored_processes=ignored,
-                            strict_contexts=scoped_release)
+                    ignored = {key for other in self.leases.values() if other.token != token
+                               for key in other.cuda_processes or []}
+                    # A ready owner can acquire additional child contexts.
+                    # Saved PID keys alone cannot prove those have exited.
+                    wait_for_foreign_settle(lease.foreign_baseline,
+                        scoped_gpus if scoped_release else None, ignored_processes=ignored,
+                        strict_contexts=scoped_release)
                     if lease.exclusive:
                         require_exclusive_cuda_free(lease.gpu_uuids)
                 with self.cv:
