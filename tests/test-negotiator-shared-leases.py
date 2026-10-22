@@ -221,6 +221,28 @@ class SharedBudgetTests(unittest.TestCase):
         self.usage.clear()
         self.broker.release(first)
 
+    def test_legacy_owner_with_multiple_process_roots_counts_resident_memory_once(self):
+        first=self.acquire(60);self.broker.ready(first)
+        peer=self.acquire(20)
+        self.usage={'333@'+GPUS[0]:5};self.broker.ready(peer)
+        legacy=self.broker.leases[first];legacy.cuda_processes=None;legacy.capacity_mib=0
+        self.usage.update({'111@'+GPUS[0]:20,'222@'+GPUS[0]:20})
+        roots=[os.getpid(),os.getppid()]
+        with mock.patch.object(m,'workload_contains_pid',side_effect=lambda root,pid:
+                (root==roots[0] and pid==111) or (root==roots[1] and pid==222)):
+            self.broker.ready(first,workload_pids=roots)
+        self.assertEqual(set(legacy.cuda_processes),{'111@'+GPUS[0],'222@'+GPUS[0]})
+        self.assertEqual(self.broker.leases[peer].cuda_processes,['333@'+GPUS[0]])
+        self.acquire(20)
+        with self.assertRaises(RuntimeError):self.acquire(1)
+
+    def test_invalid_workload_root_lists_do_not_change_a_lease(self):
+        first=self.acquire(20)
+        for roots in ([],[True],[-1],['1'],[os.getpid()]*257):
+            with self.subTest(roots=roots[:2]),self.assertRaises(ValueError):
+                self.broker.ready(first,workload_pids=roots)
+        self.assertEqual(self.broker.leases[first].state,'pending')
+
     def test_malformed_or_missing_memory_telemetry_cannot_admit_new_work(self):
         with mock.patch.object(m,'foreign_gpu_usage',side_effect=RuntimeError('unavailable')):
             with self.assertRaises(RuntimeError):self.acquire(10)

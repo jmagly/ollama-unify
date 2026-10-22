@@ -8302,10 +8302,14 @@ class Broker:
                     self.end_drain()
                 raise
 
-    def ready(self, token: str, workload_pid: int | None = None) -> dict[str, Any]:
+    def ready(self, token: str, workload_pid: int | None = None,
+              workload_pids: list[int] | None = None) -> dict[str, Any]:
         require_gpu_health(refresh=True)
-        if workload_pid is not None and (type(workload_pid) is not int or workload_pid <= 0
-                                         or not Path(f"/proc/{workload_pid}").exists()):
+        if workload_pids is not None and (not isinstance(workload_pids, list)
+                                          or not workload_pids or len(workload_pids) > 256):
+            raise ValueError("workload_pids must list live workload parents")
+        roots = ([workload_pid] if workload_pid is not None else []) + (workload_pids or [])
+        if any(type(pid) is not int or pid <= 0 or not Path(f"/proc/{pid}").exists() for pid in roots):
             raise ValueError("workload_pid must identify the live workload parent")
         with self.transition:
             usage = foreign_gpu_usage(strict=BACKEND_TYPE == "cuda")
@@ -8317,17 +8321,17 @@ class Broker:
                     raise RuntimeError(
                         "lease transition was revoked; free CUDA memory and release the lease"
                     )
-                if lease.state != "pending" and not (lease.state == "active" and workload_pid is not None):
+                if lease.state != "pending" and not (lease.state == "active" and roots):
                     raise RuntimeError("lease is not pending")
                 peers = [other for other in self.leases.values() if other.token != token
                          and set(other.gpu_uuids).intersection(lease.gpu_uuids)]
                 claimed = {key for other in peers for key in other.cuda_processes or []}
                 candidates = [key for key, used in usage.items()
                     if key.rsplit("@", 1)[-1] in lease.gpu_uuids and key not in claimed
-                    and (workload_pid is not None and workload_contains_pid(workload_pid, int(key.split('@')[0]))
-                         or workload_pid is None and (key not in (lease.foreign_baseline or {})
+                    and (roots and any(workload_contains_pid(root, int(key.split('@')[0])) for root in roots)
+                         or not roots and (key not in (lease.foreign_baseline or {})
                              or used > (lease.foreign_baseline or {}).get(key, 0)))]
-                ambiguous = workload_pid is None and candidates and any(
+                ambiguous = not roots and candidates and any(
                     other.state == "pending" or other.cuda_processes is None for other in peers)
                 previous = lease.state, lease.heartbeat_at, lease.cuda_processes
                 lease.cuda_processes = None if ambiguous else candidates
@@ -10082,7 +10086,8 @@ class ControlHandler(socketserver.StreamRequestHandler):
                                                   str(request.get("handoff_id") or ""))
                 elif action == "ready":
                     result = self.broker.ready(str(request.get("token") or ""),
-                                               workload_pid=request.get("workload_pid"))
+                                               workload_pid=request.get("workload_pid"),
+                                               workload_pids=request.get("workload_pids"))
                 elif action == "scope":
                     requested_gpu_uuids = request.get("gpu_uuids")
                     if not isinstance(requested_gpu_uuids, list):
@@ -10677,7 +10682,7 @@ def main() -> int:
             command.add_argument("--vram-mib", type=int, default=None,
                                  help="new total VRAM budget, reserved before growth")
         if name == "ready":
-            command.add_argument("--pid", dest="workload_pid", type=int, default=None,
+            command.add_argument("--pid", dest="workload_pid", type=int, action="append", default=None,
                                  help="workload parent PID for concurrent-owner CUDA accounting")
         if name == "release":
             command.add_argument(
@@ -10799,7 +10804,7 @@ def main() -> int:
             if args.vram_mib is not None:
                 control["requested_mib"] = args.vram_mib
         if args.command_name == "ready" and args.workload_pid is not None:
-            control["workload_pid"] = args.workload_pid
+            control["workload_pids"] = args.workload_pid
         result = send_control(control)
     elif args.command_name == "run":
         if not args.command:

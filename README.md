@@ -203,6 +203,9 @@ identify their CUDA process tree when multiple owners load concurrently. A plain
 `ready` remains supported; ambiguous process ownership is accounted conservatively
 and may require registering the PID before clean release. Register an already
 active owner's PID with the same ready command without restarting it.
+For a lease supervising independent containers or process trees, repeat
+`--pid PID` for every workload root. This also lets an owner registered before
+the sharing update adopt accurate resident-memory accounting without reloading.
 
 For workloads managed by another supervisor, use the explicit lifecycle:
 
