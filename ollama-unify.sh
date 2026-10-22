@@ -2449,7 +2449,11 @@ def wait_for_foreign_settle(
     baseline: dict[str, int] | None = None,
     gpu_uuids: set[str] | None = None,
     *, ignored_processes: set[str] | None = None,
+    strict_contexts: bool = False,
 ) -> None:
+    baseline = ({key: value for key, value in baseline.items()
+                 if key not in (ignored_processes or set())}
+                if baseline is not None else None)
     def observed() -> dict[str, int]:
         return {key: value for key, value in foreign_gpu_usage(strict=BACKEND_TYPE == "cuda").items()
                 if key not in (ignored_processes or set())}
@@ -2460,6 +2464,15 @@ def wait_for_foreign_settle(
         time.sleep(ANON_POLL)
         current_raw = observed()
         current = foreign_usage_by_gpu(current_raw, gpu_uuids)
+        if strict_contexts and baseline is not None:
+            # Unknown ownership cannot borrow another process's freed bytes.
+            # Even a zero-byte new CUDA context must disappear before release.
+            clean = all(key in baseline and value <= baseline[key]
+                        for key, value in current_raw.items()
+                        if gpu_uuids is None or key.rsplit('@', 1)[-1] in gpu_uuids)
+            if clean:
+                return
+            continue
         if current == last:
             if (time.monotonic() - stable_since >= ANON_SETTLE
                     and (baseline is None
@@ -2474,6 +2487,8 @@ def wait_for_foreign_settle(
     if baseline is not None:
         raise TimeoutError(
             "foreign GPU allocation did not return to its pre-lease baseline"
+            + ("; register the workload with ready --pid before release "
+               "or wait for unverified CUDA contexts to exit" if strict_contexts else "")
         )
 
 
@@ -5291,7 +5306,9 @@ class Broker:
                 "reserved_mib": reserved_by_gpu.get(gpu_uuid, 0),
                 "free_mib": min(physical_free, promised_free),
             })
-        if not reclaiming:
+        # Ordinary warm inference must not pay additional ownership queries
+        # when no external reservation exists.
+        if not reclaiming and self.leases:
             lease_capacity = {d["uuid"]: d["free_mib"] for d in self._lease_capacity_devices(
                 devices, reservation_owner=reservation_owner)}
             for device in available:
@@ -8555,7 +8572,8 @@ class Broker:
                         ignored = {key for other in self.leases.values() if other.token != token
                                    for key in other.cuda_processes or []}
                         wait_for_foreign_settle(lease.foreign_baseline,
-                            scoped_gpus if scoped_release else None, ignored_processes=ignored)
+                            scoped_gpus if scoped_release else None, ignored_processes=ignored,
+                            strict_contexts=scoped_release)
                     if lease.exclusive:
                         require_exclusive_cuda_free(lease.gpu_uuids)
                 with self.cv:

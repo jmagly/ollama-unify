@@ -182,6 +182,23 @@ class SharedBudgetTests(unittest.TestCase):
         self.assertEqual(self.broker.leases[second].cuda_processes,['222@'+GPUS[0]])
         self.assertEqual(m.Broker().leases[first].cuda_processes,['111@'+GPUS[0]])
 
+    def test_ambiguous_release_cannot_credit_peer_bytes_or_ignore_tiny_contexts(self):
+        peer=self.acquire(30)
+        self.usage={'222@'+GPUS[0]:20};self.broker.ready(peer)
+        first=self.acquire(30);other=self.acquire(30)
+        self.usage['111@'+GPUS[0]]=10
+        self.broker.ready(first)
+        self.assertIsNone(self.broker.leases[first].cuda_processes)
+        for size in (10, 1, 0):
+            self.usage['111@'+GPUS[0]]=size
+            with self.assertRaises(TimeoutError):self.broker.release(first)
+            self.assertIn(first,self.broker.leases)
+        del self.usage['111@'+GPUS[0]]
+        self.broker.release(first)
+        self.assertIn(peer,self.broker.leases)
+        self.assertIn(other,self.broker.leases)
+        self.assertEqual(self.usage,{'222@'+GPUS[0]:20})
+
     def test_malformed_or_missing_memory_telemetry_cannot_admit_new_work(self):
         with mock.patch.object(m,'foreign_gpu_usage',side_effect=RuntimeError('unavailable')):
             with self.assertRaises(RuntimeError):self.acquire(10)

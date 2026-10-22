@@ -167,6 +167,8 @@ def wait_ready(daemon, socket_path, proxy_port):
     deadline = time.monotonic() + 10
     while time.monotonic() < deadline:
         if daemon.poll() is not None:
+            if daemon.stderr.seekable():
+                daemon.stderr.seek(0)
             raise RuntimeError(daemon.stderr.read())
         if os.path.exists(socket_path):
             try:
@@ -553,10 +555,15 @@ class PoolHarness:
             env["MOCK_OLLAMA_CONTEXT_LENGTH"] = str(self.runner_context_length)
         if self.runner_gpu_scope is not None:
             env["MOCK_OLLAMA_GPU_USAGE_SCOPE"] = ",".join(self.runner_gpu_scope)
+        # Unread PIPEs can fill during the 100-request test and block the
+        # broker's logging thread, making a healthy scheduler time out.
+        stdout = open(os.path.join(self.temp_dir, "broker.stdout.log"), "w+")
+        stderr = open(os.path.join(self.temp_dir, "broker.stderr.log"), "w+")
         self.daemon = subprocess.Popen(
-            [self.helper, "serve"], env=env, stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE, text=True,
+            [self.helper, "serve"], env=env, stdout=stdout,
+            stderr=stderr, text=True,
         )
+        self.daemon.stdout, self.daemon.stderr = stdout, stderr
         wait_ready(self.daemon, self.socket_path, self.proxy_port)
         return self
 
