@@ -2383,7 +2383,7 @@ def discovery_document() -> dict[str, Any]:
                 "Acquire a lease before loading CUDA models; signal ready only after GPU allocation is resident."
             ),
             "scoped_leases": (
-                "Use repeated --gpu UUID options and give the child exactly those UUIDs in CUDA_VISIBLE_DEVICES. Pending or revoking scopes block those GPUs; active single-GPU scopes may share stable live VRAM with broker-owned Ollama lanes; multi-GPU scopes are exclusive for their whole lifetime because Ollama lane churn during peer-to-peer (NVLink/NCCL) traffic is unsafe."
+                "Use repeated --gpu UUID options and give the child exactly those UUIDs in CUDA_VISIBLE_DEVICES. Pending or revoking scopes defer Ollama placement; bounded pending single-GPU budgets may coexist with other leases; active single-GPU scopes may share stable live VRAM with broker-owned Ollama lanes; multi-GPU scopes are exclusive for their whole lifetime because Ollama lane churn during peer-to-peer (NVLink/NCCL) traffic is unsafe."
             ),
             "resize": "Call prepare before increasing VRAM use, then ready after the new allocation settles.",
             "release": "Free external CUDA allocations before releasing the lease.",
@@ -11098,8 +11098,10 @@ def lease_actions(lease: dict[str, Any], inventory: dict[str, dict[str, str]]
         actions.append(action(
             "Prepare for resize…", {"action": "prepare", "token": token},
             f"Move {owner}'s lease back to pending so it can grow its VRAM?\n\n"
-            "This stops every broker-owned Ollama lane on the host and "
-            "unloads the base Ollama model. The owner must call ready again.",
+            "The broker checks this lease's reserved budget, reclaims only "
+            "necessary managed capacity, and preserves other owners. Use "
+            "prepare --vram-mib NEW_TOTAL to increase the budget. The owner "
+            "must call ready again after its allocation settles.",
             transition_timeout(),
         ))
     if state in ("pending", "active"):
@@ -11117,8 +11119,8 @@ def lease_actions(lease: dict[str, Any], inventory: dict[str, dict[str, str]]
     actions.append(action(
         "Release lease…", {"action": "release", "token": token},
         f"End {owner}'s lease?\n\nThe broker waits for the owner's CUDA "
-        "memory to return to its pre-lease baseline and refuses if it does "
-        "not. This can take a few minutes.",
+        "contexts to exit and refuses if cleanup cannot be verified. "
+        "Shared peers keep their leases and allocations. This can take a few minutes.",
         transition_timeout(),
     ))
     actions.append(action(
@@ -11212,6 +11214,19 @@ def lease_gpu_submenu(lease: dict[str, Any], leases: list[dict[str, Any]],
     token = lease.get("token") or ""
     owner = lease.get("owner") or "unknown"
     scope = [str(value) for value in lease.get("gpu_uuids") or []]
+    def conflicts(new_scope: list[str]) -> bool:
+        for other in leases:
+            if other is lease or other.get("state") not in ("pending", "active", "revoking"):
+                continue
+            other_scope = other.get("gpu_uuids") or []
+            if other_scope and not set(new_scope).intersection(other_scope):
+                continue
+            if (len(new_scope) != 1 or len(other_scope) != 1
+                    or lease.get("exclusive") or other.get("exclusive")
+                    or not lease.get("requested_mib") or not other.get("requested_mib")
+                    or other.get("state") == "revoking"):
+                return True
+        return False
     held = {
         gpu_uuid: other.get("owner")
         for other in leases if other is not lease
@@ -11242,7 +11257,7 @@ def lease_gpu_submenu(lease: dict[str, Any], leases: list[dict[str, Any]],
                 f"leased by {held[gpu_uuid]}" if gpu_uuid in held else ""
             )),
             active,
-            gpu_uuid not in held and not (active and len(scope) == 1),
+            (active or not conflicts(new_scope)) and not (active and len(scope) == 1),
             action(
                 f"{'Remove' if active else 'Add'} {name} "
                 f"{'from' if active else 'to'} lease",
@@ -12063,7 +12078,7 @@ render_global_codex_gpu_block() {
 <!-- BEGIN ollama-unify GPU negotiator -->
 ## CUDA deployment policy
 
-Before changing or starting any Docker/container/service workload that uses CUDA on this host, run `docker gpu discover` and inspect its warnings and active lease summaries. New leases require `--owner`; suggest `--justification` and `--expected-duration` when setting up workloads, but missing purpose or duration must not halt basic deployments. Owner, purpose, GPU scope, and expected release are visible to other local agents; omitted metadata remains unknown and does not change heartbeat TTL. Use scoped `docker gpu run --gpu GPU_UUID` for foreground deployments or the scoped acquire → ready → prepare/resize → release protocol for independently supervised services. The external workload must use exactly its reserved GPU UUIDs. Fixed placement preserves an exact GPU group. Restartable single-GPU services can opt in to `--placement flexible` with ordered candidates, a priority, and drain/readiness hooks; a higher-priority fixed request waits for a reserved destination, graceful stop, verified CUDA release and readiness before admission. Fixed owners are never silently moved. Pending and revoking scopes block those GPUs. Positive single-GPU VRAM budgets may share with other leases and Ollama lanes when all promises fit. Use prepare --vram-mib NEW_TOTAL before exceeding the budget, and ready --pid WORKLOAD_PID for independently supervised concurrent loaders. Zero-budget, explicit-exclusive and multi-GPU scopes remain exclusive. Do not rely on static free-VRAM scans or bypass the broker; anonymous CUDA allocation is only best-effort. Full instructions are at `/usr/local/share/ollama-unify/AGENTS.md`.
+Before changing or starting any Docker/container/service workload that uses CUDA on this host, run `docker gpu discover` and inspect its warnings and active lease summaries. New leases require `--owner`; suggest `--justification` and `--expected-duration` when setting up workloads, but missing purpose or duration must not halt basic deployments. Owner, purpose, GPU scope, and expected release are visible to other local agents; omitted metadata remains unknown and does not change heartbeat TTL. Use scoped `docker gpu run --gpu GPU_UUID` for foreground deployments or the scoped acquire → ready → prepare/resize → release protocol for independently supervised services. The external workload must use exactly its reserved GPU UUIDs. Fixed placement preserves an exact GPU group. Restartable single-GPU services can opt in to `--placement flexible` with ordered candidates, a priority, and drain/readiness hooks; a higher-priority fixed request waits for a reserved destination, graceful stop, verified CUDA release and readiness before admission. Fixed owners are never silently moved. Pending and revoking scopes defer Ollama placement; bounded pending single-GPU budgets may coexist with other leases. Positive single-GPU VRAM budgets may share with other leases and Ollama lanes when all promises fit. Use prepare --vram-mib NEW_TOTAL before exceeding the budget, and ready --pid WORKLOAD_PID for independently supervised concurrent loaders. Zero-budget, explicit-exclusive and multi-GPU scopes remain exclusive. Do not rely on static free-VRAM scans or bypass the broker; anonymous CUDA allocation is only best-effort. Full instructions are at `/usr/local/share/ollama-unify/AGENTS.md`.
 <!-- END ollama-unify GPU negotiator -->
 CODEX_BLOCK
 }

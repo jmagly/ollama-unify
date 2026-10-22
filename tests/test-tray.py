@@ -556,9 +556,23 @@ def test_offline_and_idle_models(tray):
     assert idle["leases"] == [] and idle["lanes"] == []
 
 
+def test_budgeted_lease_scope_can_share(tray):
+    current=lease('new', 'pending', [], NOW, requested_mib=1024)
+    peer=lease('peer', 'active', [GPU0], NOW, requested_mib=1024)
+    def first_toggle():
+        return tray.lease_gpu_submenu(current, [current,peer], [GPU0], INVENTORY)['toggles'][0]
+    assert first_toggle()['enabled']
+    peer['exclusive']=True
+    assert not first_toggle()['enabled']
+    peer['exclusive']=False
+    peer['requested_mib']=0
+    assert not first_toggle()['enabled']
+
+
 def main():
     tray = load_tray(sys.argv[1])
     test_menu_model(tray)
+    test_budgeted_lease_scope_can_share(tray)
     test_model_gpu_policy_menu(tray)
     test_client_gpu_policy_menu(tray)
     test_saved_client_policy_remains_accessible(tray)
