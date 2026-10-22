@@ -8572,11 +8572,17 @@ class Broker:
                         wait_for_owned_cuda_exit(lease.cuda_processes)
                     ignored = {key for other in self.leases.values() if other.token != token
                                for key in other.cuda_processes or []}
+                    sharing = scoped_release and any(
+                        other.token != token and other.state in ("pending", "active", "revoking")
+                        and (not other.gpu_uuids or scoped_gpus.intersection(other.gpu_uuids))
+                        for other in self.leases.values())
                     # A ready owner can acquire additional child contexts.
-                    # Saved PID keys alone cannot prove those have exited.
+                    # Shared cleanup must not hide them behind another lease.
+                    # The last owner retains legacy accounting tolerance;
+                    # any leftover unregistered context quarantines its GPU.
                     wait_for_foreign_settle(lease.foreign_baseline,
                         scoped_gpus if scoped_release else None, ignored_processes=ignored,
-                        strict_contexts=scoped_release)
+                        strict_contexts=sharing)
                     if lease.exclusive:
                         require_exclusive_cuda_free(lease.gpu_uuids)
                 with self.cv:

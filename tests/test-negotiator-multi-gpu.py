@@ -867,14 +867,16 @@ class ReclamationFeasibilityTests(unittest.TestCase):
         self.required = self.busy.reserved_mib = 30000
         self.idle.reserved_mib = 20000
         self.foreign[f'998@{PAIR[0]}'] = 30000
-        self.broker.leases['active'] = mock.Mock(gpu_uuids=(PAIR[0],), state='active')
+        self.broker.leases['active'] = mock.Mock(gpu_uuids=(PAIR[0],), state='active',
+            requested_mib=30000, cuda_processes=None, capacity_mib=0)
         self.devices[0]['free_mib'] = 1920
         self.assert_preserved(scope=(PAIR[0],))
 
     def test_pending_lease_gpu_cannot_make_reclamation_look_feasible(self):
         self.devices[1]['free_mib'] = 70000
         self.foreign.clear()
-        self.broker.leases['pending'] = mock.Mock(gpu_uuids=(PAIR[1],), state='pending')
+        self.broker.leases['pending'] = mock.Mock(gpu_uuids=(PAIR[1],), state='pending',
+            requested_mib=10000, cuda_processes=None, capacity_mib=0)
         self.assert_preserved()
 
     def test_pending_evacuation_destination_promise_is_not_reclaimable(self):

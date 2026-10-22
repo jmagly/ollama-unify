@@ -201,6 +201,7 @@ class SharedBudgetTests(unittest.TestCase):
 
     def test_release_checks_contexts_created_after_readiness(self):
         first=self.acquire(30);self.broker.ready(first)
+        peer=self.acquire(30);self.broker.ready(peer)
         self.assertEqual(self.broker.leases[first].cuda_processes,[])
         self.usage['111@'+GPUS[0]]=0
         with self.assertRaises(TimeoutError):self.broker.release(first)
