@@ -3008,7 +3008,7 @@ def process_group_identity(process: Any) -> list[dict[str, int]]:
         try:
             with open(f"/proc/{entry.name}/stat", encoding="utf-8") as stream:
                 fields = stream.read().rsplit(")", 1)[1].split()
-        except FileNotFoundError:
+        except (FileNotFoundError, ProcessLookupError):
             continue
         if int(fields[2]) == process.pid and fields[0] not in {"Z", "X"}:
             members.append({"pid": int(entry.name), "start_time_ticks": int(fields[19])})

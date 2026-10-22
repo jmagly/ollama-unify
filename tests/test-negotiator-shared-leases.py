@@ -3,6 +3,7 @@
 import concurrent.futures
 import importlib.machinery
 import importlib.util
+import io
 import json
 import os
 from pathlib import Path
@@ -60,6 +61,17 @@ class SharedBudgetTests(unittest.TestCase):
             used_mib=self.overhead+sum(v for k,v in {**self.usage,**self.managed}.items() if k.endswith('@'+gpu)),
             free_mib=100-self.overhead-sum(v for k,v in {**self.usage,**self.managed}.items() if k.endswith('@'+gpu)))
             for gpu in GPUS]
+
+    def test_process_identity_scan_ignores_an_unrelated_exiting_process(self):
+        fields=['S','1','222']+['0']*17
+        fields[19]='123'
+        def stat_file(path, **_):
+            if path=='/proc/111/stat':raise ProcessLookupError('exited during read')
+            return io.StringIO('222 (server) '+' '.join(fields))
+        with mock.patch.object(m.os,'scandir',return_value=[types.SimpleNamespace(name='111'),
+                types.SimpleNamespace(name='222')]),mock.patch('builtins.open',side_effect=stat_file):
+            identity=m.process_group_identity(types.SimpleNamespace(pid=222,poll=lambda:None))
+        self.assertEqual(identity,[{'pid':222,'start_time_ticks':123}])
 
     def acquire(self, amount, gpu=GPUS[0], **kwargs):
         return self.broker.acquire('fixture', amount, 60, [gpu], **kwargs)['lease']['token']
