@@ -977,6 +977,7 @@ import shlex
 import signal
 import socket
 import socketserver
+import stat
 import subprocess
 import sys
 import threading
@@ -1382,6 +1383,124 @@ OLLAMA_MODELS = os.environ.get("OLLAMA_UNIFY_MODELS", "")
 OLLAMA_CHILD_HOME = os.environ.get("OLLAMA_UNIFY_CHILD_HOME", "/var/lib/ollama-unify")
 LOG = logging.getLogger("ollama-unify-negotiator")
 CAPACITY_IO_DEADLINE = threading.local()
+
+# One confidential principal per dedicated instance; the shared default is unchanged.
+_confidential_flag = os.environ.get("OLLAMA_UNIFY_CONFIDENTIAL", "0").strip().lower()
+if _confidential_flag not in {"0", "1", "true", "false", "yes", "no", "on", "off"}:
+    raise ValueError("invalid confidential profile flag")
+CONFIDENTIAL = _confidential_flag in {"1", "true", "yes", "on"}
+if not CONFIDENTIAL and any(os.environ.get(key) for key in (
+        "OLLAMA_UNIFY_PROJECT_ID", "OLLAMA_UNIFY_TOKEN_FILE", "OLLAMA_UNIFY_APPROVED_MODELS")):
+    raise ValueError("confidential configuration requires explicit confidential mode")
+HTTP_SOCKET = os.environ.get("OLLAMA_UNIFY_HTTP_SOCKET", "")
+PROJECT_ID = os.environ.get("OLLAMA_UNIFY_PROJECT_ID", "")
+TOKEN_FILE = os.environ.get("OLLAMA_UNIFY_TOKEN_FILE", "")
+CONFIDENTIAL_TOKEN = ""
+APPROVED_MODELS: dict[str, str] = {}
+CLIENT_READ_TIMEOUT = max(1.0, min(60.0, env_float("OLLAMA_UNIFY_CLIENT_READ_TIMEOUT", 15.0)))
+MAX_CONNECTIONS = max(1, min(128, env_int("OLLAMA_UNIFY_MAX_CONNECTIONS", 16)))
+
+
+def systemd_credential_token_allowed(info: os.stat_result) -> bool:
+    """Accept systemd 255's root-owned 0440 credential in its protected mount.
+
+    This is not a general group-readable token exception: the exact credential
+    name, directory, ownership and every nonsymlink ancestor must match.
+    """
+    credential_dir = os.environ.get("CREDENTIALS_DIRECTORY", "")
+    if (info.st_uid != 0 or info.st_gid != 0 or stat.S_IMODE(info.st_mode) != 0o440
+            or not re.fullmatch(r"/run/credentials/[A-Za-z0-9_.@-]+\.service", credential_dir)
+            or TOKEN_FILE != credential_dir + "/broker-token"):
+        return False
+    try:
+        for name in ("/", "/run", "/run/credentials", credential_dir):
+            ancestor = os.lstat(name)
+            if (not stat.S_ISDIR(ancestor.st_mode) or ancestor.st_uid != 0
+                    or ancestor.st_gid != 0 or stat.S_IMODE(ancestor.st_mode) & 0o022):
+                return False
+            if name == credential_dir and stat.S_IMODE(ancestor.st_mode) != 0o550:
+                return False
+        leaf = os.lstat(TOKEN_FILE)
+        return (stat.S_ISREG(leaf.st_mode) and leaf.st_dev == info.st_dev
+                and leaf.st_ino == info.st_ino)
+    except OSError:
+        return False
+
+
+def configure_confidential_profile() -> None:
+    """Validate the opt-in profile before opening either listener."""
+    global CONFIDENTIAL_TOKEN, APPROVED_MODELS
+    if not CONFIDENTIAL:
+        return
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}", PROJECT_ID):
+        raise ValueError("confidential profile requires a project ID")
+    if HTTP_SOCKET and (not os.path.isabs(HTTP_SOCKET) or HTTP_SOCKET == CONTROL_SOCKET):
+        raise ValueError("confidential HTTP socket must be absolute and separate from control")
+    if not POOL_ENABLED or not SELECTED_GPUS or BACKEND_TYPE != "cuda":
+        raise ValueError("confidential profile requires a selected CUDA GPU pool")
+    if LISTEN_HOST not in {"127.0.0.1", "::1"} or BACKEND_HOST not in {"127.0.0.1", "::1"}:
+        raise ValueError("confidential listeners must use loopback")
+    try:
+        approved = json.loads(os.environ.get("OLLAMA_UNIFY_APPROVED_MODELS", "{}"))
+        if not isinstance(approved, dict) or not approved:
+            raise ValueError()
+        if any(not isinstance(k, str) or not k or canonical_model_tag(k) != k
+               or not isinstance(v, str) or not re.fullmatch(r"[0-9a-f]{64}", v)
+               for k, v in approved.items()):
+            raise ValueError()
+    except (ValueError, TypeError):
+        raise ValueError("confidential profile requires canonical model tags pinned to SHA-256") from None
+    if not os.path.isabs(TOKEN_FILE):
+        raise ValueError("confidential token file must use an absolute path")
+    # O_NOFOLLOW plus fstat avoids a symlink/replacement race. No secret is in config.
+    try:
+        fd = os.open(TOKEN_FILE, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        with os.fdopen(fd, "rb") as token_file:
+            info = os.fstat(token_file.fileno())
+            private_mode = stat.S_IMODE(info.st_mode) in {0o400, 0o600}
+            credential_mode = systemd_credential_token_allowed(info) if not private_mode else False
+            if (not stat.S_ISREG(info.st_mode) or not (private_mode or credential_mode)
+                    or info.st_uid not in {0, os.geteuid()} or info.st_nlink != 1):
+                raise ValueError()
+            token = token_file.read(258).strip()
+        if not re.fullmatch(rb"[A-Za-z0-9_-]{43,128}", token):
+            raise ValueError()
+    except (OSError, ValueError):
+        raise ValueError("confidential token file must be a private regular file with a strong token") from None
+    CONFIDENTIAL_TOKEN = token.decode("ascii")
+    APPROVED_MODELS = approved
+
+
+def model_fully_gpu_resident(metadata: dict[str, Any]) -> bool:
+    """Require positive finite full-model and GPU-resident byte counts."""
+    total, resident = metadata.get("size"), metadata.get("size_vram")
+    return (type(total) in (int, float) and type(resident) in (int, float)
+            and math.isfinite(total) and math.isfinite(resident)
+            and total > 0 and resident >= total)
+
+
+def confidential_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    folded: set[str] = set()
+    for key, value in pairs:
+        # Ollama's Go JSON decoder also accepts case-insensitive field aliases.
+        if key.casefold() in folded or (key.casefold() in {"model", "options", "keep_alive"}
+                                       and key != key.casefold()):
+            raise ValueError("ambiguous JSON field")
+        folded.add(key.casefold())
+        result[key] = value
+    return result
+
+
+class ConfidentialLogFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        # Backend errors and HTTP request lines can contain client content.
+        record.msg = "confidential broker operational event"
+        record.args = ()
+        record.exc_info = None
+        record.exc_text = None
+        record.stack_info = None
+        return True
 
 HOP_HEADERS = {
     "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
@@ -5459,6 +5578,10 @@ class Broker:
             lane_id = f"lane-{self.next_lane_id}"
             self.next_lane_id += 1
         env = os.environ.copy()
+        if CONFIDENTIAL:
+            # No inherited Ollama cloud credentials/configuration reach workers.
+            env = {key: value for key, value in env.items() if not key.startswith("OLLAMA_")}
+            env["OLLAMA_NO_CLOUD"] = "1"
         if cpu_offload:
             # Pageable CPU model layers only. Presence enables these GGML
             # flags even when the inherited value is the string "0".
@@ -5523,6 +5646,8 @@ class Broker:
                 # Inherit systemd's bounded journal instead of discarding
                 # CUDA/GSP failures. The wrapper exec preserves PID/start/PGRP.
                 start_new_session=True,
+                stdout=subprocess.DEVNULL if CONFIDENTIAL else None,
+                stderr=subprocess.DEVNULL if CONFIDENTIAL else None,
             )
         except Exception:
             if startup_write is not None:
@@ -5635,6 +5760,9 @@ class Broker:
                     503,
                     "gpu_runtime_unavailable",
                 )
+            if CONFIDENTIAL and (cpu_offload or not model_fully_gpu_resident(resident_model)):
+                raise PermanentCapacityError("confidential model must be fully GPU-resident", 503,
+                                             "gpu_runtime_unavailable")
             actual_context = verified_model_context(model, resident, profile)
             if profile and math.ceil(size_vram / (1024 * 1024)) > required_mib:
                 raise PermanentCapacityError(
@@ -5815,6 +5943,9 @@ class Broker:
         aggregate. CPU-only inference and spilling around busy GPU owners are
         never an alternate admission path.
         """
+        if CONFIDENTIAL:
+            raise PermanentCapacityError("CPU model overflow is disabled for confidential inference", 403,
+                                         "cpu_offload_forbidden")
         if parallel > POOL_INSTANCE_PARALLEL:
             raise PermanentCapacityError("one CPU-offload scope supports only its configured parallel slots",
                                          422, "parallel_exceeds_capacity")
@@ -9112,8 +9243,80 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     broker: Broker
 
+    def handle_one_request(self) -> None:
+        if not CONFIDENTIAL:
+            return super().handle_one_request()
+        # Bound total request-line/header time, including slow trickle clients.
+        self._header_timer = threading.Timer(CLIENT_READ_TIMEOUT, self._expire_client)
+        self._header_timer.daemon = True
+        self._header_timer.start()
+        try:
+            super().handle_one_request()
+        finally:
+            self._header_timer.cancel()
+
+    def _expire_client(self) -> None:
+        try:
+            self.connection.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+
+    def send_error(self, code: int, message: str | None = None, explain: str | None = None) -> None:
+        if CONFIDENTIAL:
+            self.close_connection = True
+            self._send_json(code, {"reason_code": "invalid_http_request"})
+        else:
+            super().send_error(code, message, explain)
+
+    def handle_expect_100(self) -> bool:
+        if CONFIDENTIAL:
+            self.close_connection = True
+            self._send_json(417, {"reason_code": "expectation_not_supported"})
+            return False
+        return super().handle_expect_100()
+
+    def _confidential_gate(self) -> bool:
+        self.close_connection = True
+        tokens = self.headers.get_all("Authorization", [])
+        if (len(tokens) != 1 or not CONFIDENTIAL_TOKEN or not secrets.compare_digest(
+                tokens[0], "Bearer " + CONFIDENTIAL_TOKEN)):
+            self._send_json(401, {"reason_code": "authentication_required"})
+            return False
+        if (self.headers.get("Transfer-Encoding") is not None
+                or self.headers.get("Expect") is not None
+                or len(self.headers.get_all("Content-Length", [])) > 1):
+            self._send_json(400, {"reason_code": "invalid_request_framing"})
+            return False
+        length = self.headers.get("Content-Length", "0")
+        if not re.fullmatch(r"[0-9]{1,9}", length):
+            self._send_json(400, {"reason_code": "invalid_request_framing"})
+            return False
+        if int(length) > 16 * 1024 * 1024:
+            self._send_json(413, {"reason_code": "request_too_large"})
+            return False
+        if self.command == "GET" and self.path == "/healthz" and int(length) == 0:
+            self._send_json(200, {"ok": True})
+            return False
+        if self.command != "POST" or self.path not in INFERENCE_PATHS:
+            self._send_json(403, {"reason_code": "endpoint_forbidden"})
+            return False
+        forbidden = {LOGICAL_REQUEST_HEADER.lower(), RESUME_REQUEST_HEADER.lower(),
+                     GPU_UUIDS_HEADER.lower(), WARM_ADMISSION_HEADER.lower(),
+                     CPU_OFFLOAD_HEADER.lower()}
+        if any(key.lower() in forbidden for key in self.headers):
+            self._send_json(400, {"reason_code": "admission_control_forbidden"})
+            return False
+        return True
+
     def _send_json(self, status: int, payload: dict[str, Any],
                    headers: dict[str, str] | None = None) -> None:
+        if CONFIDENTIAL and status >= 400:
+            # Never return exception/backend text or client-controlled metadata.
+            code = payload.get("reason_code", "request_failed")
+            if not isinstance(code, str) or not re.fullmatch(r"[a-z_]{1,80}", code):
+                code = "request_failed"
+            payload = {"error": "Request could not be completed", "reason_code": code}
+            headers = None
         body = json.dumps(payload, separators=(",", ":")).encode()
         try:
             self.send_response(status)
@@ -9133,6 +9336,9 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         A declared name may change between requests on one connection, so
         it is refreshed without repeating the socket and process lookups.
         """
+        if CONFIDENTIAL:
+            return {"key": "project:" + PROJECT_ID, "label": PROJECT_ID,
+                    "declared": PROJECT_ID, "user_agent": "", "address": ""}
         declared = clean_client_text(self.headers.get(CLIENT_HEADER))
         agent = clean_client_text(self.headers.get("User-Agent"), 160)
         cached = getattr(self, "_identity", None)
@@ -9416,6 +9622,10 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             pass
 
     def _handle(self) -> None:
+        if CONFIDENTIAL:
+            self._header_timer.cancel()
+            if not self._confidential_gate():
+                return
         path = self.path.split("?", 1)[0]
         if self.command == "GET" and path == "/.well-known/ollama-unify-gpu-negotiator":
             requested_model = parse_qs(self.path.partition("?")[2]).get("model", [""])[0]
@@ -9455,7 +9665,60 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         if length > 16 * 1024 * 1024:
             self._send_json(413, {"error": "request body exceeds broker limit"})
             return
-        body = self.rfile.read(length) if length else b""
+        if CONFIDENTIAL:
+            deadline = time.monotonic() + CLIENT_READ_TIMEOUT
+            chunks = []
+            remaining = length
+            try:
+                while remaining:
+                    budget = deadline - time.monotonic()
+                    if budget <= 0:
+                        raise TimeoutError()
+                    self.connection.settimeout(budget)
+                    chunk = self.rfile.read1(min(remaining, 65536))
+                    if not chunk:
+                        raise ValueError()
+                    chunks.append(chunk)
+                    remaining -= len(chunk)
+                body = b"".join(chunks)
+            except (OSError, ValueError):
+                self._send_json(400, {"reason_code": "incomplete_request_body"})
+                return
+            finally:
+                self.connection.settimeout(None)
+            try:
+                payload = json.loads(body, object_pairs_hook=confidential_json_object)
+                model_name = canonical_model_tag(payload.get("model", "")) if isinstance(payload, dict) else ""
+                if not isinstance(payload, dict) or not isinstance(payload.get("model"), str):
+                    raise ValueError()
+                # GPU placement/lifecycle belong to the broker, never the caller.
+                allowed_options = {"num_ctx", "num_predict", "temperature", "top_k", "top_p",
+                                   "min_p", "seed", "stop", "repeat_last_n", "repeat_penalty",
+                                   "presence_penalty", "frequency_penalty", "typical_p",
+                                   "mirostat", "mirostat_tau", "mirostat_eta", "tfs_z"}
+                options = payload.get("options", {})
+                if ("keep_alive" in payload or not isinstance(options, dict)
+                        or set(options) - allowed_options):
+                    self._send_json(400, {"reason_code": "inference_option_forbidden"})
+                    return
+                if model_name not in APPROVED_MODELS:
+                    self._send_json(403, {"reason_code": "model_not_approved"})
+                    return
+                tags = backend_json("GET", "/api/tags", timeout=10.0).get("models", [])
+                if not any(isinstance(item, dict)
+                           and canonical_model_tag(str(item.get("name") or item.get("model") or "")) == model_name
+                           and str(item.get("digest", "")).removeprefix("sha256:") == APPROVED_MODELS[model_name]
+                           and not item.get("remote_host") and not item.get("remote_model") for item in tags):
+                    self._send_json(503, {"reason_code": "model_digest_mismatch"})
+                    return
+            except (ValueError, TypeError, AttributeError):
+                self._send_json(400, {"reason_code": "invalid_inference_body"})
+                return
+            except Exception:
+                self._send_json(503, {"reason_code": "model_verification_failed"})
+                return
+        else:
+            body = self.rfile.read(length) if length else b""
         content_type = self.headers.get("Content-Type", "")
         if self.command == "POST" and (path in INFERENCE_PATHS or path == CAPACITY_PATH):
             try:
@@ -9707,6 +9970,25 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             return
         lane = admission.lane
         try:
+            if CONFIDENTIAL:
+                if lane.cpu_offload:
+                    raise PermanentCapacityError("CPU model overflow is disabled for confidential inference", 403,
+                                                 "cpu_offload_forbidden")
+                try:
+                    running = backend_json_at(lane.host, lane.port, "GET", "/api/ps", timeout=10.0).get("models", [])
+                    approved_running = [item for item in running if isinstance(item, dict)
+                        and canonical_model_tag(str(item.get("name") or item.get("model") or "")) == model
+                        and str(item.get("digest", "")).removeprefix("sha256:") == APPROVED_MODELS.get(model)
+                        and not item.get("remote_host") and not item.get("remote_model")]
+                    verified = bool(approved_running)
+                except Exception:
+                    verified = False
+                if not verified:
+                    raise PermanentCapacityError("approved model identity unavailable", 503,
+                                                 "model_digest_mismatch")
+                if not any(model_fully_gpu_resident(item) for item in approved_running):
+                    raise PermanentCapacityError("confidential model must be fully GPU-resident", 503,
+                                                 "gpu_runtime_unavailable")
             body = self.broker.prepare_managed_body(lane, path, body, admission.warm_admission)
             if admission.warm_admission is not None:
                 self.broker.validate_warm_body(admission.warm_admission, model, path, body, prepared=True)
@@ -9768,8 +10050,11 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             }
             headers = {key: value for key, value in self.headers.items()
                        if key.lower() not in HOP_HEADERS
-                       and key.lower() not in {"host", "content-length"}
+                       and key.lower() not in ({"host", "content-length", "authorization", "cookie", "x-ollama-unify-client", "user-agent"} if CONFIDENTIAL else {"host", "content-length"})
                        and key.lower() not in broker_control_headers}
+            if CONFIDENTIAL:
+                headers = {key: value for key, value in headers.items()
+                           if key.lower() in {"content-type", "accept"}}
             if content_type and not any(
                 key.lower() == "content-type" for key in headers
             ):
@@ -9801,10 +10086,14 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 raise ConnectionAbortedError(
                     "request was cancelled before response headers"
                 )
+            if CONFIDENTIAL and response.status >= 400:
+                self._send_json(502, {"reason_code": "backend_inference_failed"})
+                return
             forwarded_headers = [
                 (key, value) for key, value in response.getheaders()
                 if key.lower() not in HOP_HEADERS
                 and key.lower() != "content-length"
+                and (not CONFIDENTIAL or key.lower() == "content-type")
             ]
             broker_headers = [
                 ("X-Ollama-Unify-Lane", lane.lane_id),
@@ -10037,12 +10326,52 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
     do_OPTIONS = _handle
 
     def log_message(self, fmt: str, *args: Any) -> None:
-        LOG.info("proxy %s - %s", self.address_string(), fmt % args)
+        if CONFIDENTIAL:
+            LOG.info("confidential HTTP request completed")
+        else:
+            LOG.info("proxy %s - %s", self.address_string(), fmt % args)
 
 
 class ThreadingHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
     daemon_threads = True
     allow_reuse_address = True
+
+    def __init__(self, *args: Any, **kwargs: Any):
+        self._connection_slots = threading.BoundedSemaphore(MAX_CONNECTIONS)
+        super().__init__(*args, **kwargs)
+
+    def process_request(self, request: Any, client_address: Any) -> None:
+        if CONFIDENTIAL and not self._connection_slots.acquire(blocking=False):
+            self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except BaseException:
+            if CONFIDENTIAL:
+                self._connection_slots.release()
+            raise
+
+    def process_request_thread(self, request: Any, client_address: Any) -> None:
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            if CONFIDENTIAL:
+                self._connection_slots.release()
+
+    def handle_error(self, request: Any, client_address: Any) -> None:
+        if CONFIDENTIAL:
+            LOG.error("confidential request failed")
+        else:
+            super().handle_error(request, client_address)
+
+
+class ThreadingUnixHTTPServer(ThreadingHTTPServer):
+    address_family = socket.AF_UNIX
+
+    def server_bind(self) -> None:
+        socketserver.TCPServer.server_bind(self)
+        self.server_name = "localhost"
+        self.server_port = 0
 
 
 class ControlHandler(socketserver.StreamRequestHandler):
@@ -10287,6 +10616,13 @@ def watch_heartbeat(token: str, requested_interval: float) -> int:
 
 def serve() -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    configure_confidential_profile()
+    if CONFIDENTIAL:
+        for handler in logging.getLogger().handlers:
+            handler.addFilter(ConfidentialLogFilter())
+        # Unexpected background/main exceptions must not bypass logging filters.
+        threading.excepthook = lambda _args: LOG.error("confidential worker failed")
+        sys.excepthook = lambda _kind, _value, _traceback: LOG.error("confidential broker failed")
     broker = Broker()
     control_path = Path(CONTROL_SOCKET)
     control_path.parent.mkdir(parents=True, exist_ok=True)
@@ -10296,8 +10632,16 @@ def serve() -> int:
     ControlHandler.broker = broker
     ProxyHandler.broker = broker
     control = ThreadingUnixServer(CONTROL_SOCKET, ControlHandler)
-    os.chmod(CONTROL_SOCKET, 0o660)
-    proxy = ThreadingHTTPServer((LISTEN_HOST, LISTEN_PORT), ProxyHandler)
+    os.chmod(CONTROL_SOCKET, 0o600 if CONFIDENTIAL else 0o660)
+    if CONFIDENTIAL and HTTP_SOCKET:
+        http_path = Path(HTTP_SOCKET)
+        http_path.parent.mkdir(parents=True, exist_ok=True)
+        if http_path.exists() or http_path.is_socket():
+            http_path.unlink()
+        proxy = ThreadingUnixHTTPServer(HTTP_SOCKET, ProxyHandler)
+        os.chmod(HTTP_SOCKET, 0o660)
+    else:
+        proxy = ThreadingHTTPServer((LISTEN_HOST, LISTEN_PORT), ProxyHandler)
 
     def shutdown(_signum: int, _frame: Any) -> None:
         with broker.cv:
@@ -10827,7 +11171,8 @@ if __name__ == "__main__":
     try:
         raise SystemExit(main())
     except (OSError, RuntimeError, TimeoutError) as exc:
-        print(f"ollama-unify negotiator: {exc}", file=sys.stderr)
+        print("ollama-unify negotiator: service failed" if CONFIDENTIAL else
+              f"ollama-unify negotiator: {exc}", file=sys.stderr)
         raise SystemExit(1)
 
 NEGOTIATOR

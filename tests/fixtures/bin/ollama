@@ -97,6 +97,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
         emit("request", host=f"{host}:{port}", gpu=gpu, path=self.path,
              model=model, request_id=payload.get("mock_request_id"),
              options=payload.get("options") or {}, keep_alive=payload.get("keep_alive"),
+             has_authorization="Authorization" in self.headers,
+             has_proxy_authorization="Proxy-Authorization" in self.headers,
+             has_cookie="Cookie" in self.headers,
              input=payload.get("input"))
         barrier_requests = int(payload.get("mock_barrier_requests") or 0)
         if barrier_requests:
