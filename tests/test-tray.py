@@ -302,6 +302,17 @@ def test_single_device_host(tray):
     assert model["gpus"][0]["title"] == f"{GPU3[:12]} · GPU · 1.9 GB / 2.0 GB · leased"
 
 
+def test_single_gpu_exclusive_reservation_is_visible(tray):
+    status = status_fixture()
+    status["leases"][1]["exclusive"] = True
+    model = build(tray, status)
+    entry = next(item for item in model["leases"] if item["title"].startswith("single-gpu"))
+    assert "(exclusive)" in " ".join(entry["details"])
+    toggles = model["lanes"][0]["submenus"][0]["toggles"]
+    gpu = next(item for item in toggles if item["key"] == GPU1)
+    assert "exclusive to single-gpu" in gpu["label"]
+
+
 def test_units_and_timeouts(tray):
     assert [tray.memory(value) for value in (0, 512, 1536, 10240, 196608)] == [
         "0 MB", "512 MB", "1.5 GB", "10 GB", "192 GB",
@@ -577,6 +588,7 @@ def main():
     test_client_gpu_policy_menu(tray)
     test_saved_client_policy_remains_accessible(tray)
     test_single_device_host(tray)
+    test_single_gpu_exclusive_reservation_is_visible(tray)
     test_units_and_timeouts(tray)
     test_labels_are_pixel_bounded(tray)
     test_offline_and_idle_models(tray)

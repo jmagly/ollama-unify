@@ -113,3 +113,6 @@ python3 "$repo_dir/tests/test-negotiator-pool.py" \
   "$test_tmp/ollama-unify-gpu-negotiator" "$repo_dir/tests/fixtures/bin"
 python3 "$repo_dir/tests/test-negotiator-multi-gpu.py" \
   "$test_tmp/ollama-unify-gpu-negotiator" "$repo_dir/tests/fixtures/bin"
+
+python3 "$repo_dir/tests/test-negotiator-exclusive.py" \
+  "$test_tmp/ollama-unify-gpu-negotiator" "$repo_dir/tests/fixtures/bin"
