@@ -1902,7 +1902,9 @@ def test_native_explicit_unload_retires_backend(helper, fixture_bin):
         assert code == 200, response
         wait_until(lambda: any(event['kind'] == 'stop' for event in events(harness.event_log)),
                    'explicit unload retires the empty backend')
-        assert not managed_lanes(harness.status())
+        # The fixture logs SIGTERM before the broker observes process-group exit.
+        wait_until(lambda: not managed_lanes(harness.status()),
+                   'explicit unload observes backend process-group exit')
 
 
 
